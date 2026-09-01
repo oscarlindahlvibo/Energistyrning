@@ -47,6 +47,14 @@ unfixable = []
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
+[lint.per-file-ignores]
+# Test method/class names are self-documenting; a one-line docstring
+# repeating the method name adds no information.
+"tests/*" = ["D100", "D101", "D102", "D103"]
+# backtest.py is a small CLI tool -- printing its report to stdout is the
+# intended behaviour, not a stray debug print.
+"custom_components/energy_planner/planner/core/backtest.py" = ["T201"]
+
 [format]
 # Like Black, use double quotes for strings.
 quote-style = "double"
