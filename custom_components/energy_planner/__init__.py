@@ -15,6 +15,7 @@ from homeassistant.exceptions import ServiceValidationError
 
 # from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import (
+    async_track_state_change_event,
     async_track_utc_time_change,
     async_track_time_interval,
 )
@@ -36,6 +37,10 @@ from .planner import (
     clear_passed_slots,
     update_entities,
     price_peak_planner,
+    async_run_shadow_planner,
+    async_setup_smart_shadow,
+    SMART_PLANNER_BATTERY_SOC_ENTITY,
+    SMART_PLANNER_PV_FORECAST_ENTITIES,
 )
 from .store import async_save_to_store, async_load_from_store
 from .utils import tz_diff
@@ -82,6 +87,7 @@ async def async_setup(hass: HomeAssistant, config):
     """Set up the Energy Planner component."""
     if DOMAIN not in hass.data:
         await async_setup_data_structure(hass)
+    await async_setup_smart_shadow(hass)
 
     @callback
     async def get_price_service(call: ServiceCall) -> None:
@@ -191,6 +197,40 @@ async def async_setup(hass: HomeAssistant, config):
         dt.timedelta(minutes=1),
     )
     hass.data[DOMAIN]["listeners"].append(check_schedule_timer)
+
+    # --- Fas 1: Smart Planner shadow mode ---
+    # Runs independently of `planner_state`/`run_planner` above: it is
+    # gated on its own switch (smart_shadow_enabled) inside
+    # async_run_shadow_planner, never on which planner is actually
+    # driving the battery. It only ever writes to the smart_* shadow
+    # sensors, never to slot_N_* or Solis.
+    @callback
+    async def run_shadow_planner(*args, **kwargs) -> None:
+        try:
+            await async_run_shadow_planner(hass)
+        except Exception:
+            _LOGGER.exception("Smart Planner shadow run failed")
+
+    shadow_timer = async_track_time_interval(
+        hass,
+        run_shadow_planner,
+        dt.timedelta(minutes=15),
+    )
+    hass.data[DOMAIN]["listeners"].append(shadow_timer)
+
+    # Re-run promptly on a big/discrete change, on top of the 15-minute
+    # cadence above (continuous power sensors like actual PV/house load
+    # are deliberately left to the interval timer -- they change too
+    # often for a per-event re-run to be useful).
+    watched_entities = [
+        SMART_PLANNER_BATTERY_SOC_ENTITY,
+        *SMART_PLANNER_PV_FORECAST_ENTITIES,
+    ]
+    shadow_state_listener = async_track_state_change_event(
+        hass, watched_entities, run_shadow_planner
+    )
+    hass.data[DOMAIN]["listeners"].append(shadow_state_listener)
+
     # Return boolean to indicate that initialization was successful.
     return True
 
@@ -210,6 +250,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.async_create_task(
         hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     )
+
+    @callback
+    async def run_shadow_planner_on_price_change(*args, **kwargs) -> None:
+        try:
+            await async_run_shadow_planner(hass)
+        except Exception:
+            _LOGGER.exception("Smart Planner shadow run failed")
+
+    nordpool_listener = async_track_state_change_event(
+        hass, [entry.data["nordpool_entity_id"]], run_shadow_planner_on_price_change
+    )
+    hass.data[DOMAIN]["listeners"].append(nordpool_listener)
     return True
 
 
