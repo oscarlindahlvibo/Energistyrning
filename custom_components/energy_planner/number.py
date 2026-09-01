@@ -225,6 +225,83 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_devices):
                 "data_store": "config",
             },
         ),
+        # --- Fas 1: Smart Planner (shadow mode) config ---
+        # Deliberately separate from max_charge_current/max_discharge_current
+        # (amps): converting amps to kW needs the battery/inverter voltage,
+        # which this integration does not know. These are explicit kW
+        # values instead -- see docs/smart-planner.md.
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "battery_max_charge_power_kw",
+                "name": "Smart Planner max charge power (kW)",
+                "default": 3.0,
+                "min_val": 0,
+                "max_val": 50,
+                "step": 0.1,
+                "unit_of_measurement": "kW",
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "battery_max_discharge_power_kw",
+                "name": "Smart Planner max discharge power (kW)",
+                "default": 3.0,
+                "min_val": 0,
+                "max_val": 50,
+                "step": 0.1,
+                "unit_of_measurement": "kW",
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "battery_charge_efficiency",
+                "name": "Smart Planner charge efficiency (%)",
+                "default": 95,
+                "min_val": 1,
+                "max_val": 100,
+                "step": 1,
+                "unit_of_measurement": PERCENTAGE,
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "battery_discharge_efficiency",
+                "name": "Smart Planner discharge efficiency (%)",
+                "default": 95,
+                "min_val": 1,
+                "max_val": 100,
+                "step": 1,
+                "unit_of_measurement": PERCENTAGE,
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "battery_cycle_cost_sek_per_kwh",
+                "name": "Smart Planner battery wear cost (SEK/kWh)",
+                "default": 0.0,
+                "min_val": 0,
+                "max_val": 10,
+                "step": 0.01,
+                "unit_of_measurement": "SEK/kWh",
+                "device_class": SensorDeviceClass.MONETARY,
+                "state_class": SensorStateClass.TOTAL,
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
     ]
 
     hass.data[DOMAIN][NUMBER_ENTITIES] = numbers
