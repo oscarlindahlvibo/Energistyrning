@@ -24,6 +24,22 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_devices):
         )
         for i in range(1, 50)
     ]
+    switches.append(
+        EnergyPlannerSwitchEntity(
+            hass,
+            {
+                "id": "smart_shadow_enabled",
+                "default": False,
+                "name": "Smart Planner shadow mode",
+                "icon": "mdi:brain",
+                "enabled": True,
+                # Runs independently of `planner_state` -- toggling this
+                # never affects which planner actually controls the
+                # battery, and Smart Planner itself never writes to
+                # slot_N_* or Solis in Fas 1.
+            },
+        )
+    )
 
     hass.data[DOMAIN][SWITCH_ENTITIES] = switches
 
