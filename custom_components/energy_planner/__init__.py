@@ -27,6 +27,7 @@ from .const import (
     SWITCH_ENTITIES,
     SENSOR_ENTITIES,
     SELECT_ENTITIES,
+    TEXT_ENTITIES,
     TIME_ENTITIES,
 )
 from .planner import (
@@ -52,6 +53,7 @@ PLATFORMS = [
     Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
+    Platform.TEXT,
     Platform.TIME,
 ]
 
@@ -73,6 +75,7 @@ async def async_setup_data_structure(hass: HomeAssistant):
         SWITCH_ENTITIES: {},
         SENSOR_ENTITIES: {},
         SELECT_ENTITIES: {},
+        TEXT_ENTITIES: {},
         "save": save,
         "listeners": [],
     }

@@ -29,7 +29,7 @@ from homeassistant.util import dt as dt_utils
 from ..const import DOMAIN
 from .core import optimizer
 from .core.economics import PriceConfig, compute_import_export_prices
-from .core.forecast_consumption import HistoricalSample, forecast_load
+from .core.forecast_consumption import HistoricalSample, forecast_load_temperature_aware
 from .core.forecast_pv import (
     HistoricalPvSample,
     PvSourceForecast,
@@ -37,6 +37,7 @@ from .core.forecast_pv import (
     forecast_pv,
 )
 from .core.models import BatteryConfig, PlanOutcome, PricePoint
+from .core.reserve import compute_dynamic_reserve
 from .nordpool_utils import fetch_nordpool_data, tzs
 from .utils import parse_datetime
 
@@ -123,6 +124,8 @@ def _battery_config_from_ha(hass: HomeAssistant) -> BatteryConfig:
             "fuse limit until these are set."
         )
 
+    reserve_cost = float(_config(hass, "reserve_cost_sek_per_kwh", 0.0))
+
     return BatteryConfig(
         capacity_kwh=capacity_wh / 1000.0,
         min_soc_fraction=min_soc_pct / 100.0,
@@ -139,6 +142,7 @@ def _battery_config_from_ha(hass: HomeAssistant) -> BatteryConfig:
         max_grid_export_power_kw=(
             float(max_grid_export_kw) if max_grid_export_kw else None
         ),
+        reserve_cost_sek_per_kwh=reserve_cost,
     )
 
 
@@ -350,6 +354,132 @@ async def _statistics_to_pv_samples(
     return samples
 
 
+async def _statistics_to_temperature_samples(
+    hass: HomeAssistant,
+    entity_id: str,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> dict[dt.datetime, float]:
+    """Return {bucket_start: mean_temperature_c} for an outdoor temperature sensor.
+
+    Uses the recorder's hourly "mean" statistic, same as
+    `_statistics_to_energy_samples`, but the values are temperatures, not
+    power -- returned as a plain dict keyed by bucket start so callers can
+    merge them into load `HistoricalSample`s by matching hour. Returns {}
+    (not an exception) on any failure, same failsafe convention as the
+    other statistics helpers.
+    """
+    try:
+        stats = await get_instance(hass).async_add_executor_job(
+            statistics_during_period,
+            hass,
+            start,
+            end,
+            {entity_id},
+            "hour",
+            None,
+            {"mean"},
+        )
+    except Exception:
+        _LOGGER.exception("Smart Planner: failed to read statistics for %s", entity_id)
+        return {}
+
+    rows = stats.get(entity_id, [])
+    result: dict[dt.datetime, float] = {}
+    for row in rows:
+        mean_temp_c = row.get("mean")
+        if mean_temp_c is None:
+            continue
+        bucket_start = dt_utils.utc_from_timestamp(row["start"])
+        result[bucket_start] = mean_temp_c
+    return result
+
+
+def _merge_temperature_into_load_samples(
+    load_samples: list[HistoricalSample], temperature_by_hour: dict[dt.datetime, float]
+) -> list[HistoricalSample]:
+    """Attach a matching hour's temperature_c onto each load HistoricalSample.
+
+    Both sample sets come from the same hourly-bucketed statistics query,
+    so bucket starts line up exactly; a load bucket with no matching
+    temperature bucket keeps temperature_c=None (handled by the
+    temperature-aware forecast's fallback chain, not an error here).
+    """
+    if not temperature_by_hour:
+        return load_samples
+    merged = []
+    for sample in load_samples:
+        temp_c = temperature_by_hour.get(sample.start)
+        merged.append(
+            HistoricalSample(
+                sample.start, sample.end, sample.energy_kwh, temperature_c=temp_c
+            )
+        )
+    return merged
+
+
+async def _slot_temperatures_forecast(
+    hass: HomeAssistant, slots: list[tuple[dt.datetime, dt.datetime]]
+) -> list[float | None]:
+    """Return a forecasted outdoor temperature per slot, or None if unavailable.
+
+    Reads the configured `weather_forecast_entity_id` (a `weather.*`
+    entity) via the `weather.get_forecasts` service (hourly forecast type)
+    and matches each slot to the forecast entry covering its start time.
+    Any missing config, missing entity, or service failure degrades to an
+    all-None list -- callers (forecast_load_temperature_aware) already
+    treat a None temperature as "fall back to time-of-day only" per slot,
+    never as an error.
+    """
+    weather_entity_id = _config(hass, "weather_forecast_entity_id", None)
+    if not weather_entity_id:
+        return [None] * len(slots)
+
+    try:
+        response = await hass.services.async_call(
+            "weather",
+            "get_forecasts",
+            {"entity_id": weather_entity_id, "type": "hourly"},
+            blocking=True,
+            return_response=True,
+        )
+    except Exception:
+        _LOGGER.exception(
+            "Smart Planner: failed to fetch weather forecast from %s",
+            weather_entity_id,
+        )
+        return [None] * len(slots)
+
+    forecast_entries = (response or {}).get(weather_entity_id, {}).get("forecast", [])
+    parsed: list[tuple[dt.datetime, float]] = []
+    for entry in forecast_entries:
+        temp = entry.get("temperature")
+        entry_time = entry.get("datetime")
+        if temp is None or entry_time is None:
+            continue
+        with contextlib.suppress(ValueError):
+            entry_dt = parse_datetime(entry_time, None)
+            if entry_dt is not None:
+                parsed.append((entry_dt, float(temp)))
+    if not parsed:
+        return [None] * len(slots)
+    parsed.sort(key=lambda p: p[0])
+
+    result: list[float | None] = []
+    for start, end in slots:
+        match = None
+        for entry_time, temp in parsed:
+            if entry_time <= start:
+                match = temp
+            elif entry_time < end:
+                match = temp
+                break
+            else:
+                break
+        result.append(match)
+    return result
+
+
 async def _build_load_forecast(
     hass: HomeAssistant, slots: list[tuple[dt.datetime, dt.datetime]]
 ):
@@ -358,13 +488,53 @@ async def _build_load_forecast(
     samples = await _statistics_to_energy_samples(
         hass, HOUSE_LOAD_POWER_ENTITY, history_start, now
     )
-    return forecast_load(
+
+    temperature_entity_id = _config(hass, "outdoor_temperature_entity_id", None)
+    if temperature_entity_id:
+        temperature_by_hour = await _statistics_to_temperature_samples(
+            hass, temperature_entity_id, history_start, now
+        )
+        samples = _merge_temperature_into_load_samples(samples, temperature_by_hour)
+    else:
+        _LOGGER.info(
+            "Smart Planner: outdoor_temperature_entity_id not configured -- "
+            "load forecast will fall back to time-of-day only (no "
+            "temperature bucketing)."
+        )
+
+    slot_temperatures_c = await _slot_temperatures_forecast(hass, slots)
+
+    recent_start = now - dt.timedelta(hours=24)
+    recent_kwh = sum(
+        s.energy_kwh for s in samples if s.start >= recent_start and s.end <= now
+    )
+
+    return forecast_load_temperature_aware(
         samples,
         slots,
+        slot_temperatures_c,
         lookback_days=LOOKBACK_DAYS_LOAD,
         split_weekday_weekend=True,
         min_samples=3,
+        recent_actual_kwh_24h=recent_kwh if recent_kwh > 0 else None,
         fallback_kwh_per_hour=None,
+    )
+
+
+def _build_reserve(
+    hass: HomeAssistant,
+    slots: list[tuple[dt.datetime, dt.datetime]],
+    load_forecast,
+    pv_forecast,
+) -> list[float]:
+    lookahead_hours = float(_config(hass, "reserve_lookahead_hours", 6.0))
+    z = float(_config(hass, "reserve_z", 1.0))
+    return compute_dynamic_reserve(
+        slots,
+        load_forecast,
+        pv_forecast=pv_forecast,
+        lookahead_hours=lookahead_hours,
+        z=z,
     )
 
 
@@ -440,6 +610,8 @@ def _publish_plan(hass: HomeAssistant, outcome: PlanOutcome) -> None:
             "cost_sek": round(s.cost_sek, 3),
             "reason": s.reason,
             "is_degraded": s.is_degraded,
+            "reserve_target_kwh": round(s.reserve_target_kwh, 3),
+            "reserve_shortfall_kwh": round(s.reserve_shortfall_kwh, 3),
         }
         for s in plan.slots
     ]
@@ -489,6 +661,7 @@ async def async_run_shadow_planner(hass: HomeAssistant) -> None:
     slots = [(p.start, p.end) for p in price_points]
     load_forecast = await _build_load_forecast(hass, slots)
     pv_forecast = await _build_pv_forecast(hass, slots)
+    reserve_kwh = _build_reserve(hass, slots, load_forecast, pv_forecast)
 
     outcome = optimizer.plan(
         prices=price_points,
@@ -497,6 +670,7 @@ async def async_run_shadow_planner(hass: HomeAssistant) -> None:
         battery_config=battery_config,
         current_soc_kwh=current_soc_kwh,
         now=dt_utils.now(),
+        reserve_kwh=reserve_kwh,
     )
 
     if not outcome.ok:

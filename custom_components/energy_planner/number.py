@@ -337,6 +337,56 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_devices):
                 "data_store": "config",
             },
         ),
+        # Dynamic reserve (forecast-uncertainty safety margin, see
+        # core/reserve.py). This is a SOFT economic shadow price, not a
+        # hard SOC floor: the optimizer only keeps the extra kWh when doing
+        # so is worth more than selling now and possibly rebuying later.
+        # 0.0 disables the reserve mechanism entirely (Fas-1 default,
+        # matches every pre-existing plan's behavior before this was
+        # added).
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "reserve_cost_sek_per_kwh",
+                "name": "Smart Planner reserve shortfall cost (SEK/kWh)",
+                "default": 0.0,
+                "min_val": 0,
+                "max_val": 10,
+                "step": 0.01,
+                "unit_of_measurement": "SEK/kWh",
+                "device_class": SensorDeviceClass.MONETARY,
+                "state_class": SensorStateClass.TOTAL,
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "reserve_lookahead_hours",
+                "name": "Smart Planner reserve lookahead (hours)",
+                "default": 6.0,
+                "min_val": 0.25,
+                "max_val": 24,
+                "step": 0.25,
+                "unit_of_measurement": UnitOfTime.HOURS,
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "reserve_z",
+                "name": "Smart Planner reserve safety factor (z)",
+                "default": 1.0,
+                "min_val": 0,
+                "max_val": 5,
+                "step": 0.1,
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
     ]
 
     hass.data[DOMAIN][NUMBER_ENTITIES] = numbers
