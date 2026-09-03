@@ -56,22 +56,33 @@ BATTERY_SOC_ENTITY = "sensor.solis_s6_solis_battery_soc"
 PV_POWER_ENTITY = "sensor.solis_s6_solis_total_pv_power"
 HOUSE_LOAD_POWER_ENTITY = "sensor.solis_s6_solis_household_load_power"
 
-# The four PV *forecast* sensors confirmed by the user (daily totals for
-# tomorrow, kWh). GAP: there is currently no confirmed set of entity IDs
-# for each source's *actual* production, which is what the historical
-# shape profile (build_daily_shape_profile) needs. Until those are wired
-# up here, the PV forecast degrades gracefully to an even daylight spread
-# (see forecast_pv.py) and every affected PlanSlot is marked is_degraded.
+# The four PV *forecast* sensors originally described by the user (daily
+# totals for tomorrow). GAP: these exact names were not found among this
+# installation's actual entities (verified against a real export of the
+# HA recorder statistics, see docs/smart-planner.md) -- kept here as the
+# documented intent, but they need to be confirmed/corrected against the
+# live instance before shadow mode can use them. Until then, PV daily-total
+# forecasting has no live source and falls back to the degraded even
+# daylight spread the same way a missing actual-production entity does.
 DEFAULT_PV_FORECAST_ENTITIES = [
     "sensor.energy_production_tomorrow",
     "sensor.energy_production_tomorrow_2",
     "sensor.energy_production_tomorrow_3",
     "sensor.energy_production_tomorrow_4",
 ]
-# GAP: fill in once the four actual-production entity IDs are confirmed,
-# e.g. ["sensor.energy_production_today", ...]. Left empty means no
-# historical PV shape profile can be built yet.
-DEFAULT_PV_ACTUAL_ENTITIES: list[str] = []
+# The four PV *actual* production entities, confirmed against a real
+# export of this installation's HA recorder statistics (one year, cross-
+# validated against two independent sources -- see docs/smart-planner.md).
+# These feed build_daily_shape_profile() so the PV forecast can use a real
+# historical shape per string/orientation instead of an even daylight
+# spread. Each is a cumulative kWh meter; _statistics_to_pv_samples reads
+# the recorder's "sum" statistic (not "mean") accordingly.
+DEFAULT_PV_ACTUAL_ENTITIES: list[str] = [
+    "sensor.solis_s6_solis_pv_energy_1",
+    "sensor.solis_s6_solis_pv_energy_2",
+    "sensor.solis_s6_solis_pv_energy_3",
+    "sensor.solis_s6_solis_pv_energy_4",
+]
 
 
 def _config(hass: HomeAssistant, key: str, default):
@@ -270,8 +281,53 @@ async def _statistics_to_pv_samples(
     start: dt.datetime,
     end: dt.datetime,
 ) -> list[HistoricalPvSample]:
-    samples = await _statistics_to_energy_samples(hass, entity_id, start, end)
-    return [HistoricalPvSample(s.start, s.end, s.energy_kwh) for s in samples]
+    """Turn a cumulative PV-energy sensor's statistics into hourly production.
+
+    Unlike `_statistics_to_energy_samples` (for *power* sensors, where
+    energy = mean power x time), the confirmed PV production entities
+    (`sensor.solis_s6_solis_pv_energy_1..4`) are cumulative *energy*
+    meters (kWh), so this reads the "sum" statistic instead of "mean" and
+    takes the hour-over-hour delta -- HA's own reset-compensated running
+    total, which cross-checked correctly against these specific entities'
+    raw state history (verified against an actual year of exported data;
+    see docs/smart-planner.md for the one entity where this reset
+    handling was found to be unreliable and should not be trusted as-is).
+    A negative hour-over-hour delta is treated as a data anomaly and
+    skipped rather than guessed at.
+    """
+    try:
+        stats = await get_instance(hass).async_add_executor_job(
+            statistics_during_period,
+            hass,
+            start,
+            end,
+            {entity_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+    except Exception:
+        _LOGGER.exception("Smart Planner: failed to read statistics for %s", entity_id)
+        return []
+
+    rows = sorted(stats.get(entity_id, []), key=lambda r: r["start"])
+    samples = []
+    prev_sum = None
+    for row in rows:
+        current_sum = row.get("sum")
+        if current_sum is None:
+            continue
+        bucket_start = dt_utils.utc_from_timestamp(row["start"])
+        bucket_end = bucket_start + dt.timedelta(hours=1)
+        if prev_sum is not None:
+            delta = current_sum - prev_sum
+            if delta >= 0:
+                samples.append(HistoricalPvSample(bucket_start, bucket_end, delta))
+            # else: negative delta -- an anomaly for these entities (none
+            # observed in the verified year of data); skip rather than
+            # invent a value.
+        prev_sum = current_sum
+    return samples
 
 
 async def _build_load_forecast(

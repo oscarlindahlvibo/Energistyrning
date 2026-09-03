@@ -132,23 +132,44 @@ hours (06:00-20:00) and marks every affected `PlanSlot.is_degraded = True`.
 The shadow sensors and plan JSON both surface `is_degraded` so this is
 never silently presented as a precise forecast.
 
-**Known Fas-1 gap**: the four *actual* production entity IDs (one per PV
-source, needed to build each source's historical shape) are not yet
-confirmed/wired into `smart_planner.py`
-(`DEFAULT_PV_ACTUAL_ENTITIES` is currently empty). Until they are set,
-PV forecasting for the whole horizon runs in the degraded even-spread
-mode. **Action needed**: confirm the four actual-production entity IDs
-(likely `sensor.energy_production_today[_2/_3/_4]` or similar -- verify
-against the live HA instance) and fill in `DEFAULT_PV_ACTUAL_ENTITIES` in
-`smart_planner.py`.
+**Resolved**: the four *actual* production entity IDs are confirmed and
+wired into `DEFAULT_PV_ACTUAL_ENTITIES` in `smart_planner.py`:
+`sensor.solis_s6_solis_pv_energy_1..4`. Confirmed by exporting one full
+year (2025-08-28 to 2026-09-01) of this installation's real HA recorder
+long-term statistics and cross-checking the per-string totals against two
+independent sources: the aggregate `sensor.solis_s6_solis_pv_total_energy_generation`
+(10 024.0 kWh vs. the four strings summing to 10 023.2 kWh) and a wholly
+separate integration's own daily-total sensors,
+`sensor.daily_pv_1..4_energy` (summing to 10 023.1 kWh). All three agree
+to within ~1 kWh over a year -- high confidence.
 
-**Also note**: there is currently no forecast source at all for *today's*
-remaining PV production (only tomorrow's daily total is confirmed to
-exist as a sensor) -- today's PV forecast is built purely from the
-historical shape profile applied against... no daily total for today,
-which currently means today's PV forecast is 0 unless a profile-based
-"today" total is added. This needs the same entity-ID confirmation as
-above; flagged rather than guessed.
+These are cumulative kWh meters, not power sensors, so
+`_statistics_to_pv_samples` reads the recorder's **"sum"** long-term
+statistic (an hour-over-hour delta) rather than "mean" -- using "mean"
+here would have silently treated a cumulative energy reading as an
+instantaneous power value and produced nonsense. The originally-named
+`sensor.energy_production_tomorrow[_2/_3/_4]` forecast sensors (daily
+totals for *tomorrow*) were NOT found in this installation's real entity
+list at all -- `DEFAULT_PV_FORECAST_ENTITIES` still names them as the
+documented intent, but they need to be re-confirmed against the live
+instance (the actual forecast-sensor names may differ, or the integration
+providing them may not be installed/enabled) before shadow mode can use
+daily-total forecasting for real. Until then, and for *today's* remaining
+production specifically (no "tomorrow"-style total exists for today
+either), PV forecasting still falls back to the degraded even-daylight
+spread and is marked accordingly.
+
+**Also flagged while verifying this**: `sensor.solis_s6_solis_household_load_total_energy`
+had 11 unexplained drops to inconsistent (not near-zero) values over the
+year, e.g. 70 824 -> 18 750 kWh, then climbing and dropping again to a
+different value (20 793, then 20 831, then 21 216...) -- not a normal
+"counter reset to 0", more consistent with a Solis integration
+reconnect momentarily re-baselining the sensor. `total_energy_consumption`
+covers the same physical quantity and had zero such anomalies over the
+same year, so Smart Planner does not use `household_load_total_energy` at
+all for now. Worth investigating on the live instance independently of
+Smart Planner (check Solis integration connectivity logs around those
+dates), but out of scope for this repo.
 
 ## Load forecast (`core/forecast_consumption.py`)
 
@@ -278,8 +299,16 @@ still worth recording:
   `update_ohmigo_action.py` added to this repo first; not present here yet
   (see `docs/legacy-scripts.md`).
 - Wallbox/Tesla true-solar-surplus charging (Fas 3).
-- Confirm the four PV actual-production entity IDs and today's PV forecast
-  source (see gap above).
-- Build the real-data backtest script (vs. the synthetic fixture).
+- Re-confirm the `DEFAULT_PV_FORECAST_ENTITIES` names (daily total for
+  *tomorrow*) against the live instance -- the originally-described names
+  were not found in a real export -- and find a source for *today's*
+  remaining PV forecast (see "PV forecast" above).
+- Build the real-data backtest script (vs. the synthetic fixture) --
+  the exported year of `sensor.solis_s6_solis_pv_energy_1..4` /
+  `total_energy_consumption` / Nordpool history is exactly the input this
+  needs.
+- Investigate the `household_load_total_energy` re-baselining anomaly on
+  the live instance (see "PV forecast" above) -- unrelated to Smart
+  Planner directly, but worth a look.
 - "What would Smart Planner have done vs. what the active planner did"
   comparison sensor.
