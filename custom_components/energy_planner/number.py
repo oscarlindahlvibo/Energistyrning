@@ -263,7 +263,7 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_devices):
             {
                 "id": "battery_charge_efficiency",
                 "name": "Smart Planner charge efficiency (%)",
-                "default": 95,
+                "default": 96,
                 "min_val": 1,
                 "max_val": 100,
                 "step": 1,
@@ -277,7 +277,7 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_devices):
             {
                 "id": "battery_discharge_efficiency",
                 "name": "Smart Planner discharge efficiency (%)",
-                "default": 95,
+                "default": 96,
                 "min_val": 1,
                 "max_val": 100,
                 "step": 1,

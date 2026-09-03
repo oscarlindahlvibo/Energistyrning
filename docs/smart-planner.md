@@ -267,6 +267,62 @@ follow-up once shadow mode has run for a few days.
   re-run on every reading -- they change too often for a per-event re-run
   to be useful.
 
+## Verified against a real year of backup data
+
+Cross-checked the assumptions above against one full year (2025-08-29 to
+2026-09-01) of this installation's actual HA recorder long-term
+statistics, exported locally and analyzed offline (never uploaded as a
+raw backup -- see the extraction scripts used during Fas 1 development).
+
+- **Battery round-trip efficiency, measured: 92.0-92.3%** (two independent
+  sensor pairs: `sensor.solis_s6_solis_total_battery_charge_energy` /
+  `..._discharge_energy`, and `sensor.solis_total_energy_charged` /
+  `..._discharged`). The Fas-1 defaults (`battery_charge_efficiency` /
+  `battery_discharge_efficiency`, `number.py`) were 95%/95% (90.25% round
+  trip); bumped to **96%/96% (92.16% round trip)** to match.
+- **PV production entities remain solidly cross-validated**: the four
+  `sensor.solis_s6_solis_pv_energy_1..4` sum to 10,023 kWh/year, matching
+  both `pv_total_energy_generation` (10,023 kWh) and the independent
+  `sensor.daily_pv_1..4_energy` tracker (10,023 kWh) to within a few kWh.
+- **SOC-calibration drift** (a battery not cycled through its full 10-100%
+  range periodically can under-report usable capacity) is a real concern
+  the user raised, but could NOT be verified from this export:
+  `sensor.solis_s6_solis_battery_soc`, `..._battery_soh`, and
+  `sensor.solis_remaining_battery_capacity` all have zero rows in the
+  long-term statistics table for the whole year, despite existing as
+  entities. The same pattern (a metadata row with no/broken statistics)
+  is how HA marks a sensor it has automatically excluded from statistics
+  after detecting erratic behavior -- exactly what happened separately to
+  `household_load_total_energy` (see below). **Action for the user**:
+  check Settings -> System -> Statistics in HA for a "fix issue" prompt on
+  the SOC/SOH sensors; if present, that independently confirms the
+  calibration-drift suspicion and needs fixing on the Solis/HA side
+  before Smart Planner (or anything else) can trust `battery_soc` at all.
+- **`household_load_total_energy` is confirmed broken**: 11 unexplained
+  drops to inconsistent (non-zero, non-matching) values over the year,
+  e.g. 70,824 -> 18,750 kWh then climbing and dropping again to 20,793,
+  20,831, 21,216... not a normal counter reset. `total_energy_consumption`
+  (used by Smart Planner) had zero such anomalies over the same year.
+- **Grid import/export**: the `tibber:`-prefixed daily statistics only
+  cover Dec 2025-Aug 2026 (~8 months, not comparable to Solis's full-year
+  totals). The one Tibber Pulse sensor that does cover the full year,
+  `sensor.tibber_pulse_*_accumulated_production`, shows 3,964 kWh export
+  vs. Solis's 5,269 kWh for the same period -- a real ~25% gap worth
+  investigating on the live instance (meter placement, missing data
+  windows), not resolved here.
+- **New gap found, not yet modeled anywhere in Smart Planner**: peak
+  hourly grid power over the year was **25,314 W** (Tibber Pulse), i.e.
+  ~36.7 A per phase on a 3-phase 230V service. The optimizer core
+  currently has no concept of a maximum grid import/export power limit at
+  all -- nothing stops it from planning a charge/discharge schedule that,
+  combined with house load, would exceed the property's actual service
+  fuse (huvudsäkring) rating. This is a safety-relevant gap, not just an
+  optimization nicety, and should be added as a `BatteryConfig`-level
+  constraint (`max_grid_import_power_kw` / `max_grid_export_power_kw`,
+  reducing the per-slot charge/discharge headroom in `battery_math.py`
+  whenever forecasted house load + planned charge would exceed it) once
+  the actual fuse rating is confirmed.
+
 ## Known bugs in the legacy `price_peak_planner.py` (documented, NOT fixed in Fas 1)
 
 Per explicit instruction: `price_peak_planner.py` is left completely
@@ -312,3 +368,17 @@ still worth recording:
   Planner directly, but worth a look.
 - "What would Smart Planner have done vs. what the active planner did"
   comparison sensor.
+- **Grid import/export power limit** (huvudsäkring / service fuse
+  protection). Confirmed via a year of real data that peak grid draw
+  reached ~36.7 A/phase; the optimizer has no constraint today that would
+  stop it planning a charge/discharge schedule that trips the property's
+  actual fuse rating when combined with house load. Needs the real fuse
+  rating from the user, then a `max_grid_import_power_kw` /
+  `max_grid_export_power_kw` addition to `BatteryConfig` enforced in
+  `battery_math.py`'s per-slot power limits.
+- Confirm whether `battery_soc`/`battery_soh`/`solis_remaining_battery_capacity`
+  show a "fix issue" prompt under Settings -> System -> Statistics in HA
+  (see "Verified against a real year of backup data" above) -- would
+  confirm the SOC-calibration-drift concern the user raised, and needs
+  fixing before those entities can be trusted by Smart Planner or
+  anything else.

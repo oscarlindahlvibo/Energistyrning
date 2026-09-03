@@ -105,8 +105,8 @@ def _battery_config_from_ha(hass: HomeAssistant) -> BatteryConfig:
             "using a conservative 3 kW placeholder. Set the real inverter "
             "limit (in kW, not amps) for an accurate plan."
         )
-    charge_eff = float(_config(hass, "battery_charge_efficiency", 95)) / 100
-    discharge_eff = float(_config(hass, "battery_discharge_efficiency", 95)) / 100
+    charge_eff = float(_config(hass, "battery_charge_efficiency", 96)) / 100
+    discharge_eff = float(_config(hass, "battery_discharge_efficiency", 96)) / 100
     cycle_cost = float(_config(hass, "battery_cycle_cost_sek_per_kwh", 0.0))
 
     return BatteryConfig(
