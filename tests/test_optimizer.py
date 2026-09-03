@@ -469,5 +469,109 @@ class TestGridPowerLimit(unittest.TestCase):
         self.assertTrue(outcome.ok, outcome.error)
 
 
+class TestReserve(unittest.TestCase):
+    def test_no_reserve_kwh_behaves_as_before(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [3.0] * 4)
+        battery = _battery(soc_resolution_kwh=0.5, reserve_cost_sek_per_kwh=5.0)
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+        for slot in outcome.result.slots:
+            self.assertEqual(slot.reserve_target_kwh, 0.0)
+            self.assertEqual(slot.reserve_shortfall_kwh, 0.0)
+
+    def test_reserve_kwh_length_mismatch_is_a_failsafe_error(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [1.0, 1.0, 1.0])
+        battery = _battery()
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+            reserve_kwh=[1.0, 2.0],
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error.code, "invalid_reserve")
+
+    def test_high_reserve_penalty_prevents_selling_below_target(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        # Flat, mildly attractive price throughout -- selling is only
+        # marginally profitable, so a real reserve penalty should win.
+        prices = _quarter_hour_prices(start, [1.0] * 8, export_ratio=1.0)
+        battery = _battery(
+            soc_resolution_kwh=0.5,
+            min_soc_fraction=0.1,
+            reserve_cost_sek_per_kwh=50.0,
+            cycle_cost_sek_per_kwh=0.0,
+        )
+        reserve_kwh = [15.0] * 8
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+            reserve_kwh=reserve_kwh,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+        min_soc_seen = min(s.target_soc_kwh for s in outcome.result.slots)
+        # min_soc_kwh (5.12) + reserve (15.0) = 20.12 -- with a steep
+        # enough penalty the optimizer should stay at or above roughly
+        # that line rather than selling down toward the hard floor.
+        self.assertGreaterEqual(min_soc_seen, battery.min_soc_kwh + 10.0)
+
+    def test_reserve_shortfall_reported_when_breached(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        # Huge price spike makes selling through the reserve worth it
+        # even with a real (but not absurd) penalty.
+        prices = _quarter_hour_prices(start, [0.5, 0.5, 10.0, 10.0], export_ratio=1.0)
+        battery = _battery(
+            soc_resolution_kwh=0.5,
+            min_soc_fraction=0.1,
+            reserve_cost_sek_per_kwh=0.5,
+        )
+        reserve_kwh = [10.0] * 4
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=15.0,
+            now=start,
+            reserve_kwh=reserve_kwh,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+        self.assertTrue(any(s.reserve_shortfall_kwh > 0 for s in outcome.result.slots))
+
+    def test_reserve_penalty_excluded_from_reported_cost_sek(self):
+        # cost_sek must reflect real projected SEK, not the internal
+        # shadow-priced planning objective -- verified via the optimizer's
+        # own internal consistency assertion (would raise if wrong).
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [1.0] * 4)
+        battery = _battery(soc_resolution_kwh=0.5, reserve_cost_sek_per_kwh=3.0)
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+            reserve_kwh=[5.0] * 4,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -282,8 +282,17 @@ def plan(
     battery_config: BatteryConfig,
     current_soc_kwh: float,
     now: dt.datetime,
+    reserve_kwh: list[float] | None = None,
 ) -> PlanOutcome:
     """Compute an optimal plan over the horizon covered by `prices`.
+
+    `reserve_kwh`, if given, must be the same length as `prices` and
+    aligned index-for-index with it (as returned by
+    `core.reserve.compute_dynamic_reserve`) -- each entry is that price
+    period's soft reserve target above `min_soc_kwh`, enforced via
+    `battery_config.reserve_cost_sek_per_kwh` as a shadow-price penalty,
+    never a hard constraint. Omit (or pass all zeros) for the pre-reserve
+    behaviour.
 
     Returns a PlanOutcome wrapping either a PlanResult or a PlanningError.
     Never raises for "normal" bad input -- see PlanningError codes. Genuine
@@ -292,6 +301,14 @@ def plan(
     error = _validate_inputs(prices, battery_config, current_soc_kwh)
     if error is not None:
         return PlanOutcome(error=error)
+    if reserve_kwh is not None and len(reserve_kwh) != len(prices):
+        return PlanOutcome(
+            error=PlanningError(
+                "invalid_reserve",
+                f"reserve_kwh length ({len(reserve_kwh)}) must match "
+                f"prices length ({len(prices)}).",
+            )
+        )
 
     resolution = battery_config.soc_resolution_kwh
     # Round min UP and max DOWN so every grid point the DP explores is
@@ -308,7 +325,15 @@ def plan(
     # further outside the band.
     start_ticks = max(min_ticks, min(max_ticks, start_ticks))
 
-    ordered_prices = sorted(prices, key=lambda p: p.start)
+    if reserve_kwh is not None:
+        _paired = sorted(
+            zip(prices, reserve_kwh, strict=True), key=lambda pr: pr[0].start
+        )
+        ordered_prices = [p for p, _ in _paired]
+        ordered_reserve = [r for _, r in _paired]
+    else:
+        ordered_prices = sorted(prices, key=lambda p: p.start)
+        ordered_reserve = [0.0] * len(ordered_prices)
 
     # dp[ticks] = (cost_so_far, prev_ticks, action_detail) for the current step
     dp: dict[int, tuple[float, int | None, dict | None]] = {
@@ -317,9 +342,10 @@ def plan(
     # history[t] = dp snapshot *before* processing slot t, to allow backtracking
     history: list[dict[int, tuple[float, int | None, dict | None]]] = []
 
-    for price_point in ordered_prices:
+    for slot_index, price_point in enumerate(ordered_prices):
         history.append(dp)
         duration_hours = price_point.duration_hours
+        reserve_target_kwh = ordered_reserve[slot_index]
         pv_kwh, pv_degraded = _forecast_for_slot(
             pv_forecast, price_point.start, price_point.end
         )
@@ -377,13 +403,23 @@ def plan(
                     battery_config,
                 ):
                     continue
-                total_cost = cost_so_far + evaluation["cost"]
+                next_soc_kwh = battery_math.ticks_to_soc_kwh(next_ticks, resolution)
+                reserve_shortfall_kwh = max(
+                    0.0,
+                    (battery_config.min_soc_kwh + reserve_target_kwh) - next_soc_kwh,
+                )
+                reserve_penalty = (
+                    reserve_shortfall_kwh * battery_config.reserve_cost_sek_per_kwh
+                )
+                total_cost = cost_so_far + evaluation["cost"] + reserve_penalty
                 detail = {
                     "charge_in_kwh": charge_in_kwh,
                     "discharge_out_kwh": discharge_out_kwh,
                     "pv_kwh": pv_kwh,
                     "load_kwh": load_kwh,
                     "degraded": degraded,
+                    "reserve_target_kwh": reserve_target_kwh,
+                    "reserve_shortfall_kwh": reserve_shortfall_kwh,
                     **evaluation,
                 }
                 existing = next_dp.get(next_ticks)
@@ -410,11 +446,15 @@ def plan(
     # dp snapshots captured in `history` (history[i] = dp *before* slot i
     # was applied, i.e. dp *after* slot i-1).
     slots: list[PlanSlot] = []
+    total_reserve_penalty = 0.0
     cur_ticks = best_ticks
     for i in range(len(ordered_prices) - 1, -1, -1):
         step_dp = dp if i == len(ordered_prices) - 1 else history[i + 1]
         _, prev_ticks, detail = step_dp[cur_ticks]
         price_point = ordered_prices[i]
+        total_reserve_penalty += (
+            detail["reserve_shortfall_kwh"] * battery_config.reserve_cost_sek_per_kwh
+        )
         target_soc_kwh = battery_math.ticks_to_soc_kwh(cur_ticks, resolution)
         state = _classify_state(
             detail["charge_in_kwh"],
@@ -445,6 +485,8 @@ def plan(
                 cost_sek=detail["cost"],
                 reason=reason,
                 is_degraded=detail["degraded"],
+                reserve_target_kwh=detail["reserve_target_kwh"],
+                reserve_shortfall_kwh=detail["reserve_shortfall_kwh"],
             )
         )
         cur_ticks = prev_ticks
@@ -456,12 +498,19 @@ def plan(
         soc_start_kwh=current_soc_kwh,
         generated_at=now,
     )
-    # Sanity: recomputed cost should match backtracked cost. A mismatch
-    # here would mean a bug in the DP/backtracking, not a bad user input --
-    # worth failing loudly rather than silently returning a wrong plan.
-    if abs(result.total_cost_sek - best_cost) >= 1e-6:
+    # Sanity: recomputed cost should match backtracked cost. best_cost is
+    # the DP's internal planning objective, which includes the reserve
+    # shadow-price penalty; result.total_cost_sek is the real projected
+    # SEK cost (what PlanSlot.cost_sek actually reflects, deliberately
+    # excluding the soft reserve penalty -- that's a planning nudge, not
+    # real money). The two must differ by exactly the total reserve
+    # penalty paid along the chosen path. A mismatch beyond that would
+    # mean a bug in the DP/backtracking, not a bad user input -- worth
+    # failing loudly rather than silently returning a wrong plan.
+    if abs(result.total_cost_sek + total_reserve_penalty - best_cost) >= 1e-6:
         raise AssertionError(
             f"Smart Planner internal inconsistency: recomputed total cost "
-            f"{result.total_cost_sek} does not match DP cost {best_cost}"
+            f"{result.total_cost_sek} + reserve penalty {total_reserve_penalty} "
+            f"does not match DP cost {best_cost}"
         )
     return PlanOutcome(result=result)

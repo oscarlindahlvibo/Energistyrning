@@ -72,6 +72,11 @@ class PvForecastPoint:
     is_degraded: bool = False
     """True if this value is a rough fallback (e.g. evenly split daily total)
     rather than a profile-shaped estimate."""
+    uncertainty_kwh: float = 0.0
+    """Estimated forecast error (e.g. historical MAE for this time-of-day/
+    season bucket), in kWh. 0.0 means "unknown/not estimated", not
+    "perfectly certain" -- callers that need a reserve should treat an
+    unestimated uncertainty conservatively rather than as zero risk."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,6 +89,10 @@ class LoadForecastPoint:
     is_degraded: bool = False
     """True if this value is a rough fallback (e.g. flat average) rather than
     a time-of-day-aware median."""
+    uncertainty_kwh: float = 0.0
+    """Estimated forecast error (e.g. historical MAE for this time-of-day/
+    temperature/season bucket), in kWh. See PvForecastPoint.uncertainty_kwh
+    for the same "0.0 means unknown, not zero risk" caveat."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,6 +116,14 @@ class BatteryConfig:
         responsibility. None means "no limit enforced" (backward
         compatible default -- most callers, including all existing
         tests, don't set this).
+    reserve_cost_sek_per_kwh: SOFT penalty (SEK per kWh of shortfall,
+        applied every slot) for letting SOC drop below that slot's
+        dynamic reserve target (see core/reserve.py). This is a shadow
+        price, not a hard floor -- the optimizer will still dip into the
+        reserve if the economic upside clears this cost, which is exactly
+        what "reserven ska vara ekonomiskt optimerad, inte ett fast SOC-
+        golv" means. 0.0 (default) disables the reserve mechanism
+        entirely, matching every pre-existing test's expectations.
     """
 
     capacity_kwh: float
@@ -120,6 +137,7 @@ class BatteryConfig:
     soc_resolution_kwh: float = 0.25
     max_grid_import_power_kw: float | None = None
     max_grid_export_power_kw: float | None = None
+    reserve_cost_sek_per_kwh: float = 0.0
 
     @property
     def min_soc_kwh(self) -> float:
@@ -180,6 +198,11 @@ class BatteryConfig:
                 f"max_grid_export_power_kw must be > 0 (or None), "
                 f"got {self.max_grid_export_power_kw}"
             )
+        if self.reserve_cost_sek_per_kwh < 0:
+            return (
+                f"reserve_cost_sek_per_kwh must be >= 0, "
+                f"got {self.reserve_cost_sek_per_kwh}"
+            )
         return None
 
 
@@ -203,6 +226,13 @@ class PlanSlot:
     """Net cost for the slot; negative means net income."""
     reason: str
     is_degraded: bool = False
+    reserve_target_kwh: float = 0.0
+    """This slot's dynamic reserve target above min_soc_kwh (see
+    core/reserve.py). 0.0 if no reserve was configured."""
+    reserve_shortfall_kwh: float = 0.0
+    """How far below (min_soc_kwh + reserve_target_kwh) this slot's SOC
+    ended up -- > 0 means the optimizer decided the economics were worth
+    dipping into the reserve. Always 0.0 if reserve_cost_sek_per_kwh is 0."""
 
 
 @dataclasses.dataclass(frozen=True)
