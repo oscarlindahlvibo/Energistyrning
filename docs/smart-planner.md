@@ -271,12 +271,52 @@ improvement over a "do nothing with the battery" baseline -- see the tool's
 own output for exact numbers, and treat the fixture as illustrative, not a
 real historical day.
 
-**Next step for real validation** (not yet built): a small script that
-pulls a real day's actual Nordpool prices + actual PV/load from the
-Recorder/statistics and feeds them through `run_backtest()`, so specific
-"the old planner did X, here's what it should have done" days can be
-checked. The building blocks (`_statistics_to_energy_samples`,
-`_statistics_to_pv_samples` in `smart_planner.py`) already exist for this.
+**Real-data validation (`core/walkforward.py` + `core/run_real_backtest.py`)**:
+unlike `core.backtest`, this replays many days of real history with NO
+look-ahead -- a decision at time t only ever sees price/load/PV
+information that would genuinely have been available at t (day-ahead
+price publication boundary, load/PV forecasts built from history
+strictly before t, a leak-free 24h-persistence temperature proxy in
+place of an unavailable archived weather forecast). It re-plans once a
+day (receding horizon / MPC-style) and executes each day's plan against
+ACTUAL prices/PV/load, reporting: baseline vs. simulated cost (SEK and
+%), grid import/export, battery throughput, same-day sell-then-rebuy-
+dearer incidents, load forecast MAE/RMSE (overall and by temperature
+bucket), PV forecast MAE/RMSE, lowest simulated SOC, and reserve-
+shortfall incidents -- the exact set requested for the pre-Fas-2
+validation. Covered by 10 tests in `tests/test_walkforward.py`,
+including one that perturbs a later day's actual data and asserts it
+does not change earlier decisions (the core no-look-ahead property).
+
+Run it against exported CSVs (see "Local extraction script" below):
+
+```bash
+PYTHONPATH=custom_components/energy_planner/planner \
+    python3 -m core.run_real_backtest ha_backtest_export --days 30 --days 90
+```
+
+**Not yet run against real data**: the walk-forward harness and its CLI
+are built and verified against synthetic CSVs matching the extraction
+script's format, but no actual export from the live instance has been
+fed through it yet -- that's the next step, and its output (in
+particular the load/PV forecast error and the sell-then-rebuy count)
+should drive how much further work points 4-5 below actually need.
+
+### Local extraction script
+
+`extract_ha_backtest_data.py` (handed to the user, not committed to this
+repo -- it's a one-off local tool, stdlib only, run directly against
+`home-assistant_v2.db` or a backup `.tar`) exports at least 90 days
+(as far as history allows) of: Nord Pool price (from HA state history
+where retained, filled in from the public elprisetjustnu.se API for the
+rest of the window -- Nord Pool doesn't normally get long-term
+statistics), `sensor.vp_ute_justerad` / `sensor.vp_ute` (outdoor
+temperature, plus a plausibility sanity check comparing the two), house
+load, total PV and PV1-4, battery SOC, battery charge/discharge energy,
+and grid import/export (Tibber preferred, Solis as a cross-check). Every
+row records its own source and resolution -- nothing is silently
+resampled to a fixed grid. Output: one CSV per category under
+`--outdir`, directly consumable by `core.run_real_backtest`.
 
 ## HA entities Smart Planner reads
 
@@ -479,17 +519,14 @@ of the pre-Fas-2 spec's 7 points:
    always 0.0 today -- see "Forecast uncertainty / dynamic reserve"
    above), so low-confidence PV days don't yet make the plan more
    conservative the way low-confidence load days do.
-6. **30+ day real-data backtest with statistics -- not started.** Needs a
-   real Nordpool price history export and (once point 1 is wired to a
-   real sensor) a real temperature history export -- neither has been
-   pulled yet, only PV/load/battery/grid data so far. The building blocks
-   (`_statistics_to_energy_samples`, `_statistics_to_pv_samples`,
-   `_statistics_to_temperature_samples` in `smart_planner.py`, plus
-   `core/backtest.py`) exist; what's missing is the actual multi-week
-   data pull and the walk-forward harness computing the specific
-   statistics requested (economic improvement vs. baseline, bought/sold
-   kWh, battery cycles, same-day sell-then-rebuy count, load/PV forecast
-   error).
+6. **30+ day real-data backtest with statistics -- tooling built, awaiting
+   a real export.** The walk-forward harness (`core/walkforward.py`),
+   its CLI (`core/run_real_backtest.py`), and the local extraction
+   script are all built, tested, and verified end-to-end against
+   synthetic data (see "Backtest" above) -- computing every statistic
+   requested, with no look-ahead. What's still missing is running it
+   against an actual export from the live instance and analyzing the
+   result.
 7. **Shadow mode only -- holds.** No Solis/`slot_N_*` writes anywhere in
    this work. Physical control stays off the table until points 1, 3, and
    6 are in a good enough state, per explicit instruction.
