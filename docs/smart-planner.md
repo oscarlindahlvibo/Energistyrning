@@ -173,15 +173,84 @@ dates), but out of scope for this repo.
 
 ## Load forecast (`core/forecast_consumption.py`)
 
-Simple median-per-time-of-day approach: for each requested period, look at
-the same time-of-day window on each of the last 28 days (optionally
-excluding weekday/weekend mismatches), and take the median energy
-consumed in that window. Falls back to "degraded" (flagged) output rather
-than a fabricated number when there isn't enough history (`min_samples=3`
-by default). History is read from `sensor.solis_s6_solis_household_load_power`
-(a *power* sensor) via Home Assistant's long-term **statistics** (hourly
-mean power -> energy), not raw state history -- much cheaper to query over
-a multi-week lookback window. No ML in Fas 1, per the approved plan.
+Two levels, both statistics/median-based (no ML in Fas 1, per the approved
+plan):
+
+- `forecast_load()`: the original v1 approach -- median energy for the
+  same time-of-day window across the last 28 days (optionally excluding
+  weekday/weekend mismatches). Kept for backward compatibility; no longer
+  called by `smart_planner.py`.
+- `forecast_load_temperature_aware()` (used by `smart_planner.py` since
+  the pre-Fas-2 temperature-forecasting work): buckets by time-of-day +
+  weekday/weekend + outdoor temperature (widening the temperature
+  tolerance once if too few matches, then falling back to the plain
+  time-of-day median, then a flat rate). Bergvärme makes outdoor
+  temperature the dominant driver of load beyond time-of-day, which the
+  v1 model ignored entirely. Each bucket also reports a robust
+  (MAD-based) `uncertainty_kwh`, consumed by `core/reserve.py`'s dynamic
+  reserve (see below). A recent-24h-actual bias multiplier (clamped
+  0.5x-2x) nudges the forecast up/down when the house has been using
+  noticeably more/less than usual lately.
+
+Both fall back to "degraded" (flagged) output rather than a fabricated
+number when there isn't enough history (`min_samples=3` by default).
+House-load history is read from
+`sensor.solis_s6_solis_household_load_power` (a *power* sensor) via Home
+Assistant's long-term **statistics** (hourly mean power -> energy), not
+raw state history -- much cheaper to query over a multi-week lookback
+window.
+
+**Outdoor temperature source: not yet configured on the live instance.**
+No confirmed outdoor-temperature sensor or weather-forecast entity name
+came out of the earlier backup scan (unlike the PV entities, which were
+independently cross-validated -- see "PV forecast" below), so
+`smart_planner.py` does not hardcode a guess. Instead, two new `text.*`
+entities let the real names be supplied from the HA UI:
+`text.energy_planner_outdoor_temperature_entity_id` (a `sensor.*` reporting
+current outdoor temperature, read via statistics for history) and
+`text.energy_planner_weather_forecast_entity_id` (a `weather.*` entity,
+queried via the `weather.get_forecasts` service, hourly type, for future
+slots' forecasted temperature). Left empty, the load forecast transparently
+degrades to the time-of-day-only tier -- never an error, never a guessed
+sensor name. **Action for the user**: find the real entity IDs (Developer
+Tools -> States, filter by "temp"/"weather") and set both text entities
+before the temperature bucketing actually activates.
+
+## Forecast uncertainty / dynamic reserve (`core/reserve.py`)
+
+Per-slot reserve target (kWh) above `min_soc_kwh`, driven by forecast
+uncertainty rather than a fixed year-round SOC floor -- the explicit
+ask was "ekonomiskt optimerad, inte ett fast SOC-golv". For each slot,
+`compute_dynamic_reserve()` sums the load forecast's `uncertainty_kwh`
+(plus half the PV forecast's `uncertainty_kwh`, since PV coming in lower
+than expected also draws down the battery) over a configurable lookahead
+window (`reserve_lookahead_hours`, default 6h), scaled by a safety factor
+`reserve_z` (default 1.0).
+
+This is wired into `optimizer.plan()` as a **soft shadow price**
+(`BatteryConfig.reserve_cost_sek_per_kwh`, a new `number.*` entity,
+default **0.0 = disabled**), not a hard constraint: the DP optimizer only
+pays the penalty for dipping below (`min_soc_kwh` + that slot's reserve
+target), so a big enough price spread can still make it sell into the
+reserve on purpose -- exactly "prefer keeping a few extra kWh over
+selling cheap and having to rebuy expensive later", but never an absolute
+floor. Each `PlanSlot` now reports `reserve_target_kwh` and
+`reserve_shortfall_kwh` so the shadow output shows when/how far the plan
+dipped into its own margin.
+
+**Not yet activated on the live instance**: `reserve_cost_sek_per_kwh`
+defaults to 0.0, so the reserve mechanism computes and is visible in the
+plan JSON but has no effect on the chosen actions until a real cost is
+set. Tuning it (and `reserve_lookahead_hours`/`reserve_z`) against real
+backtests is part of the still-outstanding walk-forward backtest work
+(see "Backtest" below).
+
+**PV forecast uncertainty: not yet populated.** `PvForecastPoint.uncertainty_kwh`
+exists in the model and `compute_dynamic_reserve()` already reads it, but
+`forecast_pv()`/`build_daily_shape_profile()` don't compute it yet --
+today the reserve is driven by load uncertainty only (`pv_weight` term is
+always 0 in practice). Populating it is part of the still-outstanding
+seasonal PV model improvement (see "What's next" below).
 
 ## Backtest (`core/backtest.py`)
 
@@ -213,13 +282,23 @@ checked. The building blocks (`_statistics_to_energy_samples`,
 
 - `sensor.solis_s6_solis_battery_soc` (current SOC)
 - The configured Nordpool entity (`nordpool_entity_id`, same as legacy planners)
-- `sensor.energy_production_tomorrow[_2/_3/_4]` (PV forecast, daily totals)
+- `sensor.energy_production_tomorrow[_2/_3/_4]` (PV forecast, daily totals --
+  documented intent only, NOT confirmed to exist on this installation; see
+  "PV forecast" above)
+- `sensor.solis_s6_solis_pv_energy_1..4` (actual PV production, confirmed)
 - `sensor.solis_s6_solis_household_load_power` (via statistics, for load history)
+- `text.energy_planner_outdoor_temperature_entity_id` -- points at a
+  `sensor.*` for outdoor temperature history (unconfigured by default; see
+  "Load forecast" above)
+- `text.energy_planner_weather_forecast_entity_id` -- points at a
+  `weather.*` entity, queried via `weather.get_forecasts` for future slots'
+  temperature (unconfigured by default)
 - Config: `battery_capacity`, `battery_shutdown_soc`, `battery_max_soc` (existing),
   plus new Fas-1 config: `battery_max_charge_power_kw`,
   `battery_max_discharge_power_kw`, `battery_charge_efficiency`,
   `battery_discharge_efficiency`, `battery_cycle_cost_sek_per_kwh`,
   `grid_max_import_power_kw`, `grid_max_export_power_kw`,
+  `reserve_cost_sek_per_kwh`, `reserve_lookahead_hours`, `reserve_z`,
   `network_cost`, `network_compensation` (existing, reused)
 
 ## HA entities Smart Planner writes (shadow only)
@@ -365,18 +444,62 @@ still worth recording:
 
 ## What's next (not in Fas 1)
 
+Before Fas 2 (bergvärme/Ohmigo/SG Ready), per explicit instruction. Status
+of the pre-Fas-2 spec's 7 points:
+
+1. **Temperature-sensitive load forecast -- done.** See "Load forecast"
+   above (`forecast_load_temperature_aware()`, wired into
+   `smart_planner.py`). Inactive until the two new `text.*` entities are
+   set on the live instance (no confirmed temperature/weather entity name
+   exists yet -- see point 3's lesson: don't guess a name from training
+   data when it can be wrong).
+2. **Forecast uncertainty / dynamic reserve -- done.** See "Forecast
+   uncertainty / dynamic reserve" above. `reserve_cost_sek_per_kwh`
+   defaults to 0.0 (no effect) until tuned against real backtests.
+3. **Verify tomorrow's PV forecast entities -- investigated, unresolved.**
+   The originally-described `sensor.energy_production_tomorrow[_2/_3/_4]`
+   were NOT found in a real export of this installation's entities (see
+   "PV forecast" above) -- confirming the user's explicit caution not to
+   assume they exist. No alternative daily-total-forecast source has been
+   identified yet either. Until a real source is confirmed (or its
+   absence is confirmed final), PV forecasting stays on the even-daylight
+   fallback, always marked `is_degraded`. **Needs**: another entity scan
+   on the live instance specifically for `weather.*` forecast attributes
+   or any solar-forecast integration (e.g. Forecast.Solar, Solcast) that
+   might already be installed.
+4. **Improve the seasonal PV model -- not started.** Blocked on point 3:
+   without a confirmed forecast-total source, there's no "tomorrow's
+   external weather/PV forecast" component to blend in. The
+   recent-14-30-days + same-period-prior-year + sunrise/sunset pieces
+   don't depend on point 3 and could be built independently, but haven't
+   been.
+5. **Optimize using forecast error, not just point forecasts -- partially
+   done.** Load uncertainty flows end-to-end into the reserve (point 2).
+   PV uncertainty does not yet (`PvForecastPoint.uncertainty_kwh` is
+   always 0.0 today -- see "Forecast uncertainty / dynamic reserve"
+   above), so low-confidence PV days don't yet make the plan more
+   conservative the way low-confidence load days do.
+6. **30+ day real-data backtest with statistics -- not started.** Needs a
+   real Nordpool price history export and (once point 1 is wired to a
+   real sensor) a real temperature history export -- neither has been
+   pulled yet, only PV/load/battery/grid data so far. The building blocks
+   (`_statistics_to_energy_samples`, `_statistics_to_pv_samples`,
+   `_statistics_to_temperature_samples` in `smart_planner.py`, plus
+   `core/backtest.py`) exist; what's missing is the actual multi-week
+   data pull and the walk-forward harness computing the specific
+   statistics requested (economic improvement vs. baseline, bought/sold
+   kWh, battery cycles, same-day sell-then-rebuy count, load/PV forecast
+   error).
+7. **Shadow mode only -- holds.** No Solis/`slot_N_*` writes anywhere in
+   this work. Physical control stays off the table until points 1, 3, and
+   6 are in a good enough state, per explicit instruction.
+
+Other, longer-standing items:
+
 - Bergvärme integration (Fas 2) -- needs `ohmigo_planner.py` and
   `update_ohmigo_action.py` added to this repo first; not present here yet
   (see `docs/legacy-scripts.md`).
 - Wallbox/Tesla true-solar-surplus charging (Fas 3).
-- Re-confirm the `DEFAULT_PV_FORECAST_ENTITIES` names (daily total for
-  *tomorrow*) against the live instance -- the originally-described names
-  were not found in a real export -- and find a source for *today's*
-  remaining PV forecast (see "PV forecast" above).
-- Build the real-data backtest script (vs. the synthetic fixture) --
-  the exported year of `sensor.solis_s6_solis_pv_energy_1..4` /
-  `total_energy_consumption` / Nordpool history is exactly the input this
-  needs.
 - Investigate the `household_load_total_energy` re-baselining anomaly on
   the live instance (see "PV forecast" above) -- unrelated to Smart
   Planner directly, but worth a look.
