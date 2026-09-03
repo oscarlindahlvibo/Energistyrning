@@ -47,6 +47,23 @@ class TestBatteryConfig(unittest.TestCase):
         self.assertIsNotNone(_config(charge_efficiency=0).validate())
         self.assertIsNotNone(_config(charge_efficiency=1.1).validate())
 
+    def test_validate_accepts_no_grid_power_limit_by_default(self):
+        cfg = _config()
+        self.assertIsNone(cfg.max_grid_import_power_kw)
+        self.assertIsNone(cfg.max_grid_export_power_kw)
+        self.assertIsNone(cfg.validate())
+
+    def test_validate_rejects_zero_or_negative_grid_power_limit(self):
+        self.assertIsNotNone(_config(max_grid_import_power_kw=0).validate())
+        self.assertIsNotNone(_config(max_grid_export_power_kw=-1).validate())
+
+    def test_validate_accepts_positive_grid_power_limit(self):
+        self.assertIsNone(
+            _config(
+                max_grid_import_power_kw=15.9, max_grid_export_power_kw=15.9
+            ).validate()
+        )
+
 
 class TestSocTicks(unittest.TestCase):
     def test_round_trip(self):

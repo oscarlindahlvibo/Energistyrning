@@ -187,6 +187,40 @@ def _evaluate_action(
     }
 
 
+def _violates_grid_power_limit(
+    charge_in_kwh: float,
+    discharge_out_kwh: float,
+    evaluation: dict,
+    duration_hours: float,
+    config: BatteryConfig,
+) -> bool:
+    """Reject a battery action that would push grid power past the fuse limit.
+
+    Only battery actions that *add to* the risk are filtered: charging
+    can only increase grid import (never export), so it's checked against
+    `max_grid_import_power_kw`; discharging can only increase grid export
+    (never import), so it's checked against `max_grid_export_power_kw`.
+    The idle action (no charge, no discharge) is never filtered here --
+    house load alone exceeding the limit is not something the battery
+    made worse, and it stays available as a fallback so the DP never runs
+    out of feasible actions for a slot.
+    """
+    epsilon = 1e-6
+    if (
+        config.max_grid_import_power_kw is not None
+        and charge_in_kwh > epsilon
+        and evaluation["grid_import_kwh"] / duration_hours
+        > config.max_grid_import_power_kw + epsilon
+    ):
+        return True
+    return bool(
+        config.max_grid_export_power_kw is not None
+        and discharge_out_kwh > epsilon
+        and evaluation["grid_export_kwh"] / duration_hours
+        > config.max_grid_export_power_kw + epsilon
+    )
+
+
 def _classify_state(
     charge_in_kwh: float,
     discharge_out_kwh: float,
@@ -335,6 +369,14 @@ def plan(
                     export_price=price_point.export_price_sek_per_kwh,
                     config=battery_config,
                 )
+                if _violates_grid_power_limit(
+                    charge_in_kwh,
+                    discharge_out_kwh,
+                    evaluation,
+                    duration_hours,
+                    battery_config,
+                ):
+                    continue
                 total_cost = cost_so_far + evaluation["cost"]
                 detail = {
                     "charge_in_kwh": charge_in_kwh,

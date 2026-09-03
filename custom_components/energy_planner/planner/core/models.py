@@ -98,6 +98,15 @@ class BatteryConfig:
         derived from amps here -- ampere-to-kW needs the battery/inverter
         voltage, which this module deliberately does not assume. Callers
         supply already-known kW values (config, or read from Solis).
+    max_grid_import_power_kw / max_grid_export_power_kw: optional caps on
+        total grid power (house load + any battery charge/discharge
+        contribution), meant to keep the plan within the property's
+        service fuse (huvudsäkring) rating. Like the battery power
+        limits, these are explicit kW -- not derived from amps here, so
+        the amps-to-kW voltage/phase-count assumption stays the caller's
+        responsibility. None means "no limit enforced" (backward
+        compatible default -- most callers, including all existing
+        tests, don't set this).
     """
 
     capacity_kwh: float
@@ -109,6 +118,8 @@ class BatteryConfig:
     discharge_efficiency: float
     cycle_cost_sek_per_kwh: float
     soc_resolution_kwh: float = 0.25
+    max_grid_import_power_kw: float | None = None
+    max_grid_export_power_kw: float | None = None
 
     @property
     def min_soc_kwh(self) -> float:
@@ -153,6 +164,22 @@ class BatteryConfig:
             )
         if self.soc_resolution_kwh <= 0:
             return f"soc_resolution_kwh must be > 0, got {self.soc_resolution_kwh}"
+        if (
+            self.max_grid_import_power_kw is not None
+            and self.max_grid_import_power_kw <= 0
+        ):
+            return (
+                f"max_grid_import_power_kw must be > 0 (or None), "
+                f"got {self.max_grid_import_power_kw}"
+            )
+        if (
+            self.max_grid_export_power_kw is not None
+            and self.max_grid_export_power_kw <= 0
+        ):
+            return (
+                f"max_grid_export_power_kw must be > 0 (or None), "
+                f"got {self.max_grid_export_power_kw}"
+            )
         return None
 
 

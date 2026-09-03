@@ -302,6 +302,41 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_devices):
                 "data_store": "config",
             },
         ),
+        # Grid power limit (huvudsäkring / service fuse protection). Like
+        # the battery power limits above, explicit kW, not derived from
+        # amps -- the amps-to-kW voltage/phase-count math is the caller's
+        # responsibility. Default 15.9 kW = 23 A x 230 V x 3 phases: a
+        # sustained-power target confirmed by the user as safe to run for
+        # longer stretches, deliberately below the 20 A fuse's rated limit
+        # (which tolerates brief peaks above 20 A but not sustained ones).
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "grid_max_import_power_kw",
+                "name": "Smart Planner max grid import power (kW)",
+                "default": 15.9,
+                "min_val": 0,
+                "max_val": 100,
+                "step": 0.1,
+                "unit_of_measurement": "kW",
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
+        EnergyPlannerNumberEntity(
+            hass,
+            {
+                "id": "grid_max_export_power_kw",
+                "name": "Smart Planner max grid export power (kW)",
+                "default": 15.9,
+                "min_val": 0,
+                "max_val": 100,
+                "step": 0.1,
+                "unit_of_measurement": "kW",
+                "enabled": True,
+                "data_store": "config",
+            },
+        ),
     ]
 
     hass.data[DOMAIN][NUMBER_ENTITIES] = numbers

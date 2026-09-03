@@ -109,6 +109,20 @@ def _battery_config_from_ha(hass: HomeAssistant) -> BatteryConfig:
     discharge_eff = float(_config(hass, "battery_discharge_efficiency", 96)) / 100
     cycle_cost = float(_config(hass, "battery_cycle_cost_sek_per_kwh", 0.0))
 
+    # Grid power limit (service fuse protection, see number.py). None of
+    # these are hard requirements for a plan to exist -- absence just
+    # means no cap is enforced -- but leaving them unconfigured on an
+    # installation with a real fuse constraint risks planning a schedule
+    # that trips it, so this is logged, not just silently defaulted.
+    max_grid_import_kw = _config(hass, "grid_max_import_power_kw", None)
+    max_grid_export_kw = _config(hass, "grid_max_export_power_kw", None)
+    if max_grid_import_kw is None or max_grid_export_kw is None:
+        _LOGGER.warning(
+            "Smart Planner: grid_max_import_power_kw/grid_max_export_power_kw "
+            "not configured -- Smart Planner will not respect any service "
+            "fuse limit until these are set."
+        )
+
     return BatteryConfig(
         capacity_kwh=capacity_wh / 1000.0,
         min_soc_fraction=min_soc_pct / 100.0,
@@ -119,6 +133,12 @@ def _battery_config_from_ha(hass: HomeAssistant) -> BatteryConfig:
         discharge_efficiency=discharge_eff,
         cycle_cost_sek_per_kwh=cycle_cost,
         soc_resolution_kwh=0.25,
+        max_grid_import_power_kw=(
+            float(max_grid_import_kw) if max_grid_import_kw else None
+        ),
+        max_grid_export_power_kw=(
+            float(max_grid_export_kw) if max_grid_export_kw else None
+        ),
     )
 
 

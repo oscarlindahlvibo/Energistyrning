@@ -219,6 +219,7 @@ checked. The building blocks (`_statistics_to_energy_samples`,
   plus new Fas-1 config: `battery_max_charge_power_kw`,
   `battery_max_discharge_power_kw`, `battery_charge_efficiency`,
   `battery_discharge_efficiency`, `battery_cycle_cost_sek_per_kwh`,
+  `grid_max_import_power_kw`, `grid_max_export_power_kw`,
   `network_cost`, `network_compensation` (existing, reused)
 
 ## HA entities Smart Planner writes (shadow only)
@@ -310,18 +311,31 @@ raw backup -- see the extraction scripts used during Fas 1 development).
   vs. Solis's 5,269 kWh for the same period -- a real ~25% gap worth
   investigating on the live instance (meter placement, missing data
   windows), not resolved here.
-- **New gap found, not yet modeled anywhere in Smart Planner**: peak
-  hourly grid power over the year was **25,314 W** (Tibber Pulse), i.e.
-  ~36.7 A per phase on a 3-phase 230V service. The optimizer core
-  currently has no concept of a maximum grid import/export power limit at
-  all -- nothing stops it from planning a charge/discharge schedule that,
-  combined with house load, would exceed the property's actual service
-  fuse (huvudsäkring) rating. This is a safety-relevant gap, not just an
-  optimization nicety, and should be added as a `BatteryConfig`-level
-  constraint (`max_grid_import_power_kw` / `max_grid_export_power_kw`,
-  reducing the per-slot charge/discharge headroom in `battery_math.py`
-  whenever forecasted house load + planned charge would exceed it) once
-  the actual fuse rating is confirmed.
+- **Grid power limit -- found and fixed.** Peak hourly grid power over the
+  year was **25,314 W** (Tibber Pulse), i.e. ~36.7 A/phase on a 3-phase
+  230V service -- against a confirmed **20 A** service fuse
+  (huvudsäkring), so the property has already been drawing roughly
+  **1.8x its rated fuse current** at times. The optimizer previously had
+  no concept of a grid power limit at all. Now implemented:
+  `BatteryConfig.max_grid_import_power_kw` / `max_grid_export_power_kw`
+  (`core/models.py`), enforced in `optimizer.py` by excluding any
+  charge/discharge candidate action that would push that slot's grid
+  import or export power over the configured cap -- charging is only
+  filtered against the import cap (it can't affect export), discharging
+  only against the export cap, and the idle action is never filtered (a
+  house-load-driven overage the battery can't help isn't grounds to
+  make the slot infeasible). Configured via two new number entities,
+  `grid_max_import_power_kw` / `grid_max_export_power_kw`
+  (`number.py`), both defaulting to **15.9 kW = 23 A x 230V x 3 phases**
+  -- per the user, running at ~23 A briefly is fine, but not for
+  extended stretches, so the default targets a sustained-safe level
+  rather than the fuse's bare rated limit (which tolerates brief spikes
+  above 20 A but not sustained ones). Covered by
+  `tests/test_optimizer.py::TestGridPowerLimit` and
+  `tests/test_battery_math.py`'s new `BatteryConfig.validate()` cases.
+  `None` (unconfigured) means no limit is enforced -- backward compatible
+  with every existing test and the shadow-mode default until the two new
+  number entities are set on the live instance.
 
 ## Known bugs in the legacy `price_peak_planner.py` (documented, NOT fixed in Fas 1)
 
@@ -368,14 +382,6 @@ still worth recording:
   Planner directly, but worth a look.
 - "What would Smart Planner have done vs. what the active planner did"
   comparison sensor.
-- **Grid import/export power limit** (huvudsäkring / service fuse
-  protection). Confirmed via a year of real data that peak grid draw
-  reached ~36.7 A/phase; the optimizer has no constraint today that would
-  stop it planning a charge/discharge schedule that trips the property's
-  actual fuse rating when combined with house load. Needs the real fuse
-  rating from the user, then a `max_grid_import_power_kw` /
-  `max_grid_export_power_kw` addition to `BatteryConfig` enforced in
-  `battery_math.py`'s per-slot power limits.
 - Confirm whether `battery_soc`/`battery_soh`/`solis_remaining_battery_capacity`
   show a "fix issue" prompt under Settings -> System -> Statistics in HA
   (see "Verified against a real year of backup data" above) -- would

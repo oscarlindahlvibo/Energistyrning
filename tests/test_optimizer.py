@@ -379,5 +379,95 @@ class TestOutputShape(unittest.TestCase):
             self.assertTrue(slot.reason)
 
 
+class TestGridPowerLimit(unittest.TestCase):
+    def test_charging_is_capped_by_grid_import_limit(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [0.2] * 4)
+        # 7 kW battery charge power would need ~7.4 kW from the grid (95%
+        # efficiency) with no PV -- cap the grid import well below that.
+        battery = _battery(
+            soc_resolution_kwh=0.5,
+            max_grid_import_power_kw=2.0,
+        )
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+        for slot in outcome.result.slots:
+            if slot.grid_import_kwh > 0:
+                import_power_kw = slot.grid_import_kwh / (
+                    (slot.end - slot.start).total_seconds() / 3600.0
+                )
+                self.assertLessEqual(import_power_kw, 2.0 + 1e-6)
+
+    def test_selling_is_capped_by_grid_export_limit(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [3.0] * 4, export_ratio=0.9)
+        battery = _battery(
+            soc_resolution_kwh=0.5,
+            max_grid_export_power_kw=1.0,
+        )
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=battery.max_soc_kwh,
+            now=start,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+        for slot in outcome.result.slots:
+            if slot.grid_export_kwh > 0:
+                export_power_kw = slot.grid_export_kwh / (
+                    (slot.end - slot.start).total_seconds() / 3600.0
+                )
+                self.assertLessEqual(export_power_kw, 1.0 + 1e-6)
+
+    def test_idle_action_stays_available_even_if_load_alone_exceeds_limit(self):
+        # House load by itself (5 kWh in 15 minutes = 20 kW) already blows
+        # past a 2 kW import cap -- the battery cannot fix that by doing
+        # nothing, and the optimizer must still return a plan rather than
+        # treating every slot as infeasible.
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [1.0])
+        load = [LoadForecastPoint(prices[0].start, prices[0].end, 5.0)]
+        battery = _battery(
+            soc_resolution_kwh=0.5,
+            max_grid_import_power_kw=2.0,
+            max_charge_power_kw=0.0001,
+            max_discharge_power_kw=7.0,
+        )
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=load,
+            battery_config=battery,
+            current_soc_kwh=25.0,
+            now=start,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+
+    def test_no_limit_configured_behaves_as_before(self):
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        prices = _quarter_hour_prices(start, [0.2, 0.2, 3.0, 3.0])
+        battery = _battery(soc_resolution_kwh=0.5)
+        self.assertIsNone(battery.max_grid_import_power_kw)
+        self.assertIsNone(battery.max_grid_export_power_kw)
+        outcome = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+        )
+        self.assertTrue(outcome.ok, outcome.error)
+
+
 if __name__ == "__main__":
     unittest.main()
