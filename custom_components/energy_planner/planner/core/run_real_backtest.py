@@ -71,10 +71,24 @@ def load_prices(data_dir: Path, price_config: PriceConfig) -> list[PricePoint]:
 
 
 def load_temperature(data_dir: Path) -> dict[dt.datetime, float]:
-    rows = _read_csv(data_dir / "temperature.csv")
+    """Load outdoor temperature, preferring an SMHI export over the HA sensor.
+
+    `temperature_smhi.csv` (from `fetch_smhi_temperature.py`, run separately
+    when the HA temperature sensor is known to be unreliable -- see
+    docs/smart-planner.md) is used if present; otherwise falls back to
+    `temperature.csv`'s "outdoor_adjusted" column from the main HA export.
+    """
+    smhi_path = data_dir / "temperature_smhi.csv"
+    if smhi_path.exists():
+        rows = _read_csv(smhi_path)
+        wanted_label = "outdoor_smhi"
+    else:
+        rows = _read_csv(data_dir / "temperature.csv")
+        wanted_label = "outdoor_adjusted"
+
     result: dict[dt.datetime, float] = {}
     for row in rows:
-        if row.get("label") != "outdoor_adjusted":
+        if row.get("label") != wanted_label:
             continue
         try:
             start = _parse_dt(row["start"])
