@@ -224,7 +224,17 @@ def load_soc_initial(
 def print_report(label: str, result, baseline_cost: float) -> None:
     plan_cost = result.total_cost_sek
     improvement_sek = baseline_cost - plan_cost
-    improvement_pct = (improvement_sek / baseline_cost * 100) if baseline_cost else 0.0
+    # A percent-of-baseline is only a meaningful "cost reduction" framing
+    # when the baseline itself was a positive cost. When the baseline was
+    # net income (negative cost, e.g. a sunny month with heavy PV export),
+    # dividing by a negative number flips the sign and produces a percent
+    # that reads backwards (e.g. "-520%" for a real improvement) -- so
+    # that case is reported as N/A rather than a misleading number, with
+    # the unambiguous absolute SEK figure standing on its own.
+    if baseline_cost > 0:
+        improvement_pct_str = f"{improvement_sek / baseline_cost * 100:+.1f}%"
+    else:
+        improvement_pct_str = "N/A (baseline was net income, % not meaningful)"
 
     print(f"\n{'=' * 78}\n{label}\n{'=' * 78}")
     print(f"Executed slots: {len(result.executed_slots)}")
@@ -233,7 +243,7 @@ def print_report(label: str, result, baseline_cost: float) -> None:
     print(f"1. Baseline (actual, real metered) cost:  {baseline_cost:10.2f} SEK")
     print(f"2. Smart Planner simulated cost:          {plan_cost:10.2f} SEK")
     print(
-        f"3. Improvement:                            {improvement_sek:10.2f} SEK ({improvement_pct:+.1f}%)"
+        f"3. Improvement:                            {improvement_sek:10.2f} SEK ({improvement_pct_str})"
     )
     print(
         f"4. Grid import (simulated):                {result.total_grid_import_kwh:10.2f} kWh"
