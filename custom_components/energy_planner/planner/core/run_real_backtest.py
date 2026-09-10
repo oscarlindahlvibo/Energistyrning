@@ -170,11 +170,16 @@ def load_pv_strings(data_dir: Path) -> dict[str, list[HistoricalPvSample]]:
 def load_grid(data_dir: Path) -> tuple[list[HistoricalSample], list[HistoricalSample]]:
     """Return (grid_import_actual, grid_export_actual) samples.
 
-    Prefers Tibber labels (per the user: most trusted) over Solis if
-    both are present.
+    Merges hour-by-hour rather than picking one label exclusively:
+    Tibber (per the user: most trusted) wins where it has a reading, but
+    Tibber Pulse coverage can end earlier than Solis's own measurement
+    (observed in practice -- Tibber stopped ~3 weeks before the rest of
+    a real export's window), so Solis fills whatever hours Tibber
+    doesn't cover instead of that whole stretch silently scoring as
+    zero import/export.
     """
     rows = _read_csv(data_dir / "grid.csv")
-    by_label: dict[str, list[HistoricalSample]] = {}
+    by_label: dict[str, dict[dt.datetime, HistoricalSample]] = {}
     for row in rows:
         try:
             start = _parse_dt(row["start"])
@@ -182,16 +187,18 @@ def load_grid(data_dir: Path) -> tuple[list[HistoricalSample], list[HistoricalSa
             value = float(row["value"])
         except (ValueError, KeyError):
             continue
-        by_label.setdefault(row["label"], []).append(
-            HistoricalSample(start, end, value)
+        by_label.setdefault(row["label"], {})[start] = HistoricalSample(
+            start, end, value
         )
 
-    import_samples = by_label.get("grid_import_tibber") or by_label.get(
-        "grid_import_solis", []
-    )
-    export_samples = by_label.get("grid_export_tibber") or by_label.get(
-        "grid_export_solis", []
-    )
+    def _merge(solis_label: str, tibber_label: str) -> list[HistoricalSample]:
+        merged: dict[dt.datetime, HistoricalSample] = {}
+        merged.update(by_label.get(solis_label, {}))
+        merged.update(by_label.get(tibber_label, {}))
+        return [merged[k] for k in sorted(merged)]
+
+    import_samples = _merge("grid_import_solis", "grid_import_tibber")
+    export_samples = _merge("grid_export_solis", "grid_export_tibber")
     return import_samples, export_samples
 
 
@@ -348,7 +355,24 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    overall_end = max(prices[-1].end, load_samples[-1].end)
+    # overall_end must never exceed what the ACTUAL-outcome series (load,
+    # PV) can support: prices/temperature commonly come from a different,
+    # more recent source than a backup snapshot's own recorder data (seen
+    # in practice -- a live price-history export reaching to "today" vs.
+    # a days-old backup's load/PV data), and scoring a window past where
+    # load/PV actuals end would silently treat those hours as 0 kWh
+    # consumed/produced rather than skipping them.
+    end_candidates = [prices[-1].end, load_samples[-1].end]
+    if pv_actual_total:
+        end_candidates.append(pv_actual_total[-1].end)
+    overall_end = min(end_candidates)
+    if load_samples[-1].end < prices[-1].end:
+        print(
+            f"\nNOTE: load/PV data ends {load_samples[-1].end.date()} but price "
+            f"data reaches {prices[-1].end.date()} (different export runs) -- "
+            f'using {overall_end.date()} as "now" for this backtest so no '
+            f"window extends past what load/PV actuals can actually score."
+        )
     windows = args.days or [30, 90]
 
     for days in sorted(windows):
