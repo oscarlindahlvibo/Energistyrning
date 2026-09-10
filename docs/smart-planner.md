@@ -313,10 +313,33 @@ rest of the window -- Nord Pool doesn't normally get long-term
 statistics), `sensor.vp_ute_justerad` / `sensor.vp_ute` (outdoor
 temperature, plus a plausibility sanity check comparing the two), house
 load, total PV and PV1-4, battery SOC, battery charge/discharge energy,
-and grid import/export (Tibber preferred, Solis as a cross-check). Every
-row records its own source and resolution -- nothing is silently
-resampled to a fixed grid. Output: one CSV per category under
-`--outdir`, directly consumable by `core.run_real_backtest`.
+grid import/export (Tibber preferred, Solis as a cross-check), and the
+ground-source heat pump's (bergvärmepump) three channels
+(`sensor.bergvarmepump_channel_a/b/c_energy`, confirmed present during
+earlier Fas 1 calibration work but not previously wired into this
+export) -- lets the heat pump's own share of house load be broken out
+from the rest once winter data exists (the first real export covered
+only June-September, with the user confirming unusually low heat pump
+usage during that window, so this hasn't been analyzed yet). Every row
+records its own source and resolution -- nothing is silently resampled
+to a fixed grid. Output: one CSV per category under `--outdir`, directly
+consumable by `core.run_real_backtest`.
+
+Two companion converter scripts handle a broken/gap-limited primary
+temperature or price source: `convert_neighbor_temperature.py` turns a
+generic HA history export (any single entity, `entity_id,state,
+last_changed` columns) into `temperature_neighbor.csv`, and
+`convert_price_history.py` does the same for a Nord Pool current-price
+sensor's history into `prices.csv` -- both never forward-fill across a
+gap longer than a few hours (temperature) or at all (price: a stale
+price is economically wrong in a way stale temperature isn't), so a
+real gap shows up as missing data rather than a fabricated value.
+`fetch_smhi_temperature.py` fetches free official SMHI station history
+as a third temperature source. `core.run_real_backtest`'s
+`load_temperature()` and `load_grid()` merge whichever of these are
+present hour-by-hour (highest-quality source wins per hour) rather than
+picking one exclusively, since real exports have been observed to have
+different coverage windows from different sources.
 
 ## HA entities Smart Planner reads
 
@@ -507,26 +530,47 @@ of the pre-Fas-2 spec's 7 points:
    on the live instance specifically for `weather.*` forecast attributes
    or any solar-forecast integration (e.g. Forecast.Solar, Solcast) that
    might already be installed.
-4. **Improve the seasonal PV model -- not started.** Blocked on point 3:
-   without a confirmed forecast-total source, there's no "tomorrow's
-   external weather/PV forecast" component to blend in. The
-   recent-14-30-days + same-period-prior-year + sunrise/sunset pieces
-   don't depend on point 3 and could be built independently, but haven't
-   been.
-5. **Optimize using forecast error, not just point forecasts -- partially
+4. **Improve the seasonal PV model -- done.** `core/solar.py` (new,
+   dependency-free sunrise/sunset) + `core/forecast_pv.py`'s
+   `forecast_pv_seasonal()`: blends recent history with the same
+   calendar period a year ago, clips to the day's real daylight window,
+   and estimates the daily total the same recent/prior-year way with a
+   robust uncertainty figure. Wired into both `smart_planner.py` (live)
+   and `core/walkforward.py` (backtest). The "tomorrow's external
+   weather/PV forecast" piece (point 3) still has no confirmed source,
+   but the function accepts an optional `weather_daily_total_kwh`
+   override that would slot in immediately if/when one is found --
+   nothing here was blocked on point 3 after all. **Not yet validated
+   against real prior-year data**: the only real export pulled so far
+   covers ~4 months (no year-ago window exists yet), so the seasonal
+   blend has only been exercised via its recent-only fallback path in
+   practice; the prior-year blending itself is covered by synthetic
+   tests but wants a real multi-year comparison once that data exists.
+5. **Optimize using forecast error, not just point forecasts -- mostly
    done.** Load uncertainty flows end-to-end into the reserve (point 2).
-   PV uncertainty does not yet (`PvForecastPoint.uncertainty_kwh` is
-   always 0.0 today -- see "Forecast uncertainty / dynamic reserve"
-   above), so low-confidence PV days don't yet make the plan more
-   conservative the way low-confidence load days do.
-6. **30+ day real-data backtest with statistics -- tooling built, awaiting
-   a real export.** The walk-forward harness (`core/walkforward.py`),
-   its CLI (`core/run_real_backtest.py`), and the local extraction
-   script are all built, tested, and verified end-to-end against
-   synthetic data (see "Backtest" above) -- computing every statistic
-   requested, with no look-ahead. What's still missing is running it
-   against an actual export from the live instance and analyzing the
-   result.
+   PV uncertainty now does too (`PvForecastPoint.uncertainty_kwh` is
+   populated by `forecast_pv_seasonal()`'s daily-total uncertainty,
+   spread across that day's slots) -- a low-confidence PV day now also
+   grows the reserve the same way a low-confidence load day already did.
+   Not yet done: nothing yet *uses* "high certainty + big price spread ->
+   sell more aggressively" as a positive signal, only the conservative
+   side (grow the reserve on low confidence) is wired.
+6. **30+ day real-data backtest with statistics -- done.** Ran the
+   30-day and 90-day backtests against real exported data (price
+   history + load/PV/battery/grid from a HA backup + outdoor temperature
+   from a neighboring property's sensor and SMHI, since the primary
+   sensor had been broken for months). Found and fixed three real bugs
+   in the process: the extraction script wrote house-load/PV-total in
+   Watts instead of kWh (~1000x too high), the backtest window could
+   silently extend past what load/PV actuals could score when different
+   export runs had different end dates, and the improvement-percent
+   display read backwards when the baseline was net income. Results
+   (30 days, Aug 2026): baseline -135.50 SEK vs. simulated -839.87 SEK
+   (704 SEK better), sell-then-rebuy-dearer incidents present but a
+   minor drag (~29 SEK of the 704 SEK), and mostly explained by the
+   battery being full at midday (forced to export PV surplus cheap)
+   rather than a forecasting failure, since prices are known for the
+   whole horizon at decision time.
 7. **Shadow mode only -- holds.** No Solis/`slot_N_*` writes anywhere in
    this work. Physical control stays off the table until points 1, 3, and
    6 are in a good enough state, per explicit instruction.
