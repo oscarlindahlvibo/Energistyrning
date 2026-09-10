@@ -30,12 +30,7 @@ from ..const import DOMAIN
 from .core import optimizer
 from .core.economics import PriceConfig, compute_import_export_prices
 from .core.forecast_consumption import HistoricalSample, forecast_load_temperature_aware
-from .core.forecast_pv import (
-    HistoricalPvSample,
-    PvSourceForecast,
-    build_daily_shape_profile,
-    forecast_pv,
-)
+from .core.forecast_pv import HistoricalPvSample, forecast_pv_seasonal
 from .core.models import BatteryConfig, PlanOutcome, PricePoint
 from .core.reserve import compute_dynamic_reserve
 from .nordpool_utils import fetch_nordpool_data, tzs
@@ -541,46 +536,61 @@ def _build_reserve(
 async def _build_pv_forecast(
     hass: HomeAssistant, slots: list[tuple[dt.datetime, dt.datetime]]
 ):
+    """Seasonal PV forecast for the horizon.
+
+    Recent shape blended with the same period a year ago, clipped to
+    real sunrise/sunset, with a robust uncertainty figure -- see
+    core.forecast_pv.forecast_pv_seasonal. Falls back gracefully per
+    source/day when a year of history isn't available yet; never
+    guesses when nothing is available at all (marked degraded instead).
+    """
     now = dt_utils.now()
     tomorrow = (now + dt.timedelta(days=1)).date()
-    today = now.date()
 
-    sources: list[PvSourceForecast] = []
-    profiles: dict[str, dict] = {}
-
-    profile_history_start = now - dt.timedelta(days=LOOKBACK_DAYS_PV_PROFILE)
+    # Wide enough to reach the same calendar period a year ago (not just
+    # LOOKBACK_DAYS_PV_PROFILE's 21 days) -- the seasonal model needs
+    # that history to blend against; a fresh installation with less than
+    # a year of data simply won't have any prior-year rows in range, and
+    # forecast_pv_seasonal already degrades to the recent-only shape in
+    # that case.
+    seasonal_history_start = now - dt.timedelta(days=380)
     actual_entities = DEFAULT_PV_ACTUAL_ENTITIES
 
+    sources_actual: dict[str, list[HistoricalPvSample]] = {}
+    for entity_id in actual_entities:
+        sources_actual[entity_id] = await _statistics_to_pv_samples(
+            hass, entity_id, seasonal_history_start, now
+        )
+
+    weather_daily_total_kwh: dict[str, dict[dt.date, float]] = {}
     for i, forecast_entity in enumerate(DEFAULT_PV_FORECAST_ENTITIES):
+        if i >= len(actual_entities):
+            continue
         state = hass.states.get(forecast_entity)
-        daily_total: dict = {}
         if state is not None and state.state not in ("unknown", "unavailable"):
             with contextlib.suppress(ValueError):
-                daily_total[tomorrow] = float(state.state)
-        sources.append(
-            PvSourceForecast(name=forecast_entity, daily_total_kwh=daily_total)
-        )
+                weather_daily_total_kwh[actual_entities[i]] = {
+                    tomorrow: float(state.state)
+                }
 
-        if i < len(actual_entities):
-            actual_samples = await _statistics_to_pv_samples(
-                hass, actual_entities[i], profile_history_start, now
-            )
-            profile = build_daily_shape_profile(
-                actual_samples, bucket_minutes=15, min_days=5
-            )
-            if profile is not None:
-                profiles[forecast_entity] = profile
-
-    if not profiles:
+    if not any(sources_actual.values()):
         _LOGGER.info(
-            "Smart Planner: no PV production history profile available yet "
+            "Smart Planner: no PV production history available yet "
             "(DEFAULT_PV_ACTUAL_ENTITIES is empty or has too little history) "
             "-- falling back to an even daylight spread for today/tomorrow's "
-            "PV forecast. This is a known Fas-1 gap, see docs/smart-planner.md."
+            "PV forecast."
         )
 
-    del today  # not currently used for a "today" forecast source -- see gap note above
-    return forecast_pv(sources, slots, profiles=profiles, bucket_minutes=15)
+    return forecast_pv_seasonal(
+        sources_actual,
+        slots,
+        hass.config.latitude,
+        hass.config.longitude,
+        now.tzinfo,
+        weather_daily_total_kwh=weather_daily_total_kwh,
+        bucket_minutes=15,
+        recent_days=LOOKBACK_DAYS_PV_PROFILE,
+    )
 
 
 def _publish_unavailable(hass: HomeAssistant, reason_code: str, message: str) -> None:

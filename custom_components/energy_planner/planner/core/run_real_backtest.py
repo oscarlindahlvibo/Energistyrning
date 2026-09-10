@@ -314,6 +314,13 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--network-cost-sek-per-kwh", type=float, default=0.0)
     parser.add_argument("--network-compensation-sek-per-kwh", type=float, default=0.0)
+    parser.add_argument(
+        "--latitude",
+        type=float,
+        default=59.33,
+        help="Installation latitude, for the PV forecast's sunrise/sunset daylight constraint (default: Stockholm -- override with the real location)",
+    )
+    parser.add_argument("--longitude", type=float, default=18.06)
     args = parser.parse_args(argv[1:])
 
     price_config = PriceConfig(
@@ -411,7 +418,9 @@ def main(argv: list[str]) -> int:
             battery_config=battery_config,
             start=actual_start,
             end=overall_end,
-            config=WalkforwardConfig(),
+            config=WalkforwardConfig(
+                latitude_deg=args.latitude, longitude_deg=args.longitude
+            ),
         )
         baseline_cost = baseline_actual_cost_sek(
             window_prices, grid_import_actual, grid_export_actual

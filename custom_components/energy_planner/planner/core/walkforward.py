@@ -24,14 +24,14 @@ No Home Assistant imports. No look-ahead by construction:
   against yet (see docs/smart-planner.md), so this is the closest
   leak-free stand-in; it is intentionally naive and the resulting load
   forecast error partly reflects that, not just the bucket model itself.
-- The PV forecast's daily total is a simple recent-average persistence
-  estimate per source, computed only from production strictly before the
-  decision time. Production (`smart_planner.py`) does not have even this
-  today (no confirmed forecast-total entity exists -- see the PV-forecast
-  gap in docs/smart-planner.md, where it would fall back to 0), so this
-  backtest is deliberately a bit more capable than production currently
-  is, in order to produce a meaningful PV forecast error measurement
-  (requirement 10) rather than a trivial "always predicts zero" result.
+- The PV forecast uses `core.forecast_pv.forecast_pv_seasonal` (the same
+  function `smart_planner.py` uses live): a shape blended from recent
+  history and the same calendar period a year ago, clipped to the day's
+  real sunrise/sunset, with the daily total estimated the same
+  recent/prior-year way -- fed only samples strictly before the decision
+  time, computed per target date so a slot further into the horizon
+  still only ever sees data known at decision time (see the filtering
+  right before the `forecast_pv_seasonal` call below).
 
 Execution model (receding horizon / MPC-style): a plan computed at a
 decision point is executed slot-by-slot against ACTUAL prices/PV/load
@@ -52,12 +52,7 @@ import statistics
 
 from . import battery_math, optimizer
 from .forecast_consumption import HistoricalSample, forecast_load_temperature_aware
-from .forecast_pv import (
-    HistoricalPvSample,
-    PvSourceForecast,
-    build_daily_shape_profile,
-    forecast_pv,
-)
+from .forecast_pv import HistoricalPvSample, forecast_pv_seasonal
 from .models import BatteryConfig, PricePoint, SlotState
 from .reserve import compute_dynamic_reserve
 
@@ -71,14 +66,19 @@ class WalkforwardConfig:
     Pool's real day-ahead publication time, roughly early afternoon)."""
     lookback_days_load: int = 60
     lookback_days_pv_profile: int = 21
-    lookback_days_pv_total: int = 14
-    """Window for the naive recent-average PV daily-total persistence
-    estimate (see module docstring)."""
+    """Recent-history window for the seasonal PV shape/total blend (see
+    core.forecast_pv.forecast_pv_seasonal) -- also how far back the
+    same-period-last-year window is centered from."""
     temp_tolerance_c: float = 3.0
     min_samples: int = 3
     reserve_lookahead_hours: float = 6.0
     reserve_z: float = 1.0
     pv_bucket_minutes: int = 15
+    latitude_deg: float = 59.33
+    longitude_deg: float = 18.06
+    """Default to Stockholm -- override with the real installation's
+    coordinates (e.g. from HA's `hass.config.latitude/longitude`) for a
+    correct sunrise/sunset daylight constraint on the PV forecast."""
 
 
 @dataclasses.dataclass
@@ -320,27 +320,6 @@ def _persistence_temperature_for_slot(
     return None
 
 
-def _recent_daily_pv_total(
-    samples: list[HistoricalPvSample], as_of: dt.datetime, lookback_days: int
-) -> float | None:
-    """Mean of full calendar-day PV totals over recent days before `as_of`.
-
-    Covers the last `lookback_days` days strictly before `as_of` -- the
-    backtest's naive persistence stand-in for a real forecast-total
-    source (see module docstring).
-    """
-    by_day: dict[dt.date, float] = {}
-    cutoff = as_of - dt.timedelta(days=lookback_days)
-    for sample in samples:
-        if not (cutoff <= sample.start < as_of):
-            continue
-        day_key = sample.start.date()
-        by_day[day_key] = by_day.get(day_key, 0.0) + sample.energy_kwh
-    if len(by_day) < 3:
-        return None
-    return statistics.mean(by_day.values())
-
-
 def _known_price_horizon(
     prices: list[PricePoint], decision_time: dt.datetime
 ) -> list[PricePoint]:
@@ -438,36 +417,23 @@ def run_walkforward(
             fallback_kwh_per_hour=None,
         )
 
-        profile_cutoff = decision_time - dt.timedelta(
-            days=config.lookback_days_pv_profile
-        )
-        pv_sources: list[PvSourceForecast] = []
-        profiles = {}
-        for name, samples in pv_sources_for_profile.items():
-            history_pv_samples = [
-                s for s in samples if profile_cutoff <= s.start < decision_time
-            ]
-            profile = build_daily_shape_profile(
-                history_pv_samples, bucket_minutes=config.pv_bucket_minutes, min_days=5
-            )
-            if profile is not None:
-                profiles[name] = profile
-            all_history_pv = [s for s in samples if s.start < decision_time]
-            daily_total = _recent_daily_pv_total(
-                all_history_pv, decision_time, config.lookback_days_pv_total
-            )
-            daily_total_kwh = {}
-            if daily_total is not None:
-                horizon_days = {p.start.date() for p in horizon_prices}
-                daily_total_kwh = dict.fromkeys(horizon_days, daily_total)
-            pv_sources.append(
-                PvSourceForecast(name=name, daily_total_kwh=daily_total_kwh)
-            )
-        pv_forecast = forecast_pv(
-            pv_sources,
+        # Strictly historical samples only, regardless of how far into the
+        # horizon a target date falls -- forecast_pv_seasonal computes
+        # each target date's recent/prior-year windows from the date
+        # itself, so leaking anything at or after decision_time here
+        # would leak into a future-dated slot's forecast too.
+        sources_actual_known = {
+            name: [s for s in samples if s.start < decision_time]
+            for name, samples in pv_sources_for_profile.items()
+        }
+        pv_forecast = forecast_pv_seasonal(
+            sources_actual_known,
             slots,
-            profiles=profiles,
+            config.latitude_deg,
+            config.longitude_deg,
+            decision_time.tzinfo,
             bucket_minutes=config.pv_bucket_minutes,
+            recent_days=config.lookback_days_pv_profile,
         )
 
         reserve_kwh = compute_dynamic_reserve(
