@@ -572,6 +572,66 @@ class TestReserve(unittest.TestCase):
         )
         self.assertTrue(outcome.ok, outcome.error)
 
+    def test_low_uncertainty_sells_more_aggressively_than_high_uncertainty(self):
+        # Requirement 5 of the pre-Fas-2 spec: "low certainty -> more
+        # conservative selling; high certainty + big price spread -> more
+        # aggressive selling". The reserve mechanism already implements
+        # this as an emergent property -- a small reserve_kwh (high
+        # forecast confidence) barely constrains the DP's pure economic
+        # optimization, while a large reserve_kwh (low confidence) makes
+        # it hold more SOC back -- rather than needing a second, separate
+        # "be more aggressive" mechanism layered on top. This demonstrates
+        # that property directly: identical prices/battery/starting SOC,
+        # only reserve_kwh differs.
+        start = dt.datetime(2026, 1, 10, 0, 0, tzinfo=TZ)
+        # A real price spread (cheap now, expensive later) so there is
+        # something genuinely worth selling into.
+        prices = _quarter_hour_prices(start, [0.5, 0.5, 5.0, 5.0], export_ratio=1.0)
+        battery = _battery(
+            soc_resolution_kwh=0.5,
+            min_soc_fraction=0.1,
+            reserve_cost_sek_per_kwh=2.0,
+        )
+
+        high_confidence = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+            reserve_kwh=[0.5] * 4,
+        )
+        low_confidence = optimizer.plan(
+            prices=prices,
+            pv_forecast=[],
+            load_forecast=[],
+            battery_config=battery,
+            current_soc_kwh=20.0,
+            now=start,
+            reserve_kwh=[15.0] * 4,
+        )
+        self.assertTrue(high_confidence.ok, high_confidence.error)
+        self.assertTrue(low_confidence.ok, low_confidence.error)
+
+        high_confidence_min_soc = min(
+            s.target_soc_kwh for s in high_confidence.result.slots
+        )
+        low_confidence_min_soc = min(
+            s.target_soc_kwh for s in low_confidence.result.slots
+        )
+        # High confidence (small reserve) sells further down; low
+        # confidence (large reserve) holds more back.
+        self.assertLess(high_confidence_min_soc, low_confidence_min_soc)
+        # And it should actually export more into the expensive slots.
+        high_confidence_export = sum(
+            s.grid_export_kwh for s in high_confidence.result.slots
+        )
+        low_confidence_export = sum(
+            s.grid_export_kwh for s in low_confidence.result.slots
+        )
+        self.assertGreater(high_confidence_export, low_confidence_export)
+
 
 if __name__ == "__main__":
     unittest.main()
